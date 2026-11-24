@@ -74,8 +74,14 @@ const CASES: number[][][] = [
   [[T, L]], [[T, B]], [], [[T, R]], [[L, R]], [[R, B]], [[L, B]], [],
 ];
 
+// Corners in order tl, tr, br, bl: offsets and their bit in the case index.
+const CX = [0, 1, 1, 0], CY = [0, 0, 1, 1], CBIT = [8, 4, 2, 1];
+
 function trace(f: Float32Array, W: number, H: number, next: Int32Array, ex: Float32Array, ey: Float32Array) {
-  const lv = 0.5;
+  // Blurred masks take values in steps of 1/16, so 0.5 itself occurs; a level
+  // a hair off it keeps contour points off the grid corners (no zero-length,
+  // direction-less segments).
+  const lv = 0.5 - 1e-4;
   for (let y = 0; y < H - 1; y++) {
     for (let x = 0; x < W - 1; x++) {
       const tl = f[y * W + x], tr = f[y * W + x + 1], bl = f[(y + 1) * W + x], br = f[(y + 1) * W + x + 1];
@@ -92,12 +98,25 @@ function trace(f: Float32Array, W: number, H: number, next: Int32Array, ex: Floa
         const ea = edgeId(a, x, y, W), eb = edgeId(b, x, y, W);
         edgePoint(a, x, y, tl, tr, bl, br, lv, ea, ex, ey);
         edgePoint(b, x, y, tl, tr, bl, br, lv, eb, ex, ey);
-        // Orient so the inside (higher values) is on a consistent side.
-        const mx = (ex[ea] + ex[eb]) / 2 - x, my = (ey[ea] + ey[eb]) / 2 - y;
-        const gx = (tr - tl) * (1 - my) + (br - bl) * my;
-        const gy = (bl - tl) * (1 - mx) + (br - tr) * mx;
-        const dx = ex[eb] - ex[ea], dy = ey[eb] - ey[ea];
-        if (dx * gy - dy * gx > 0) next[ea] = eb; else next[eb] = ea;
+        // Orient every segment with the inside on the same side. The segment
+        // splits the cell's corners into two sides; the smaller side holds
+        // corners of a single state (in a saddle cell the other side holds
+        // both), so one of those corners tells which side is inside.
+        const ax = ex[ea], ay = ey[ea], dx = ex[eb] - ax, dy = ey[eb] - ay;
+        let pick = -1, pickSide = 0, pickAbs = -1, pos = 0, neg = 0;
+        const cr = [0, 0, 0, 0];
+        for (let q = 0; q < 4; q++) {
+          cr[q] = dx * (y + CY[q] - ay) - dy * (x + CX[q] - ax);
+          if (cr[q] > 1e-9) pos++; else if (cr[q] < -1e-9) neg++;
+        }
+        const lone = pos === 0 ? -1 : neg === 0 ? 1 : pos <= neg ? 1 : -1;
+        for (let q = 0; q < 4; q++) {
+          const side = cr[q] > 1e-9 ? 1 : cr[q] < -1e-9 ? -1 : 0;
+          if (side === lone && Math.abs(cr[q]) > pickAbs) { pick = q; pickSide = side; pickAbs = Math.abs(cr[q]); }
+        }
+        if (pick < 0) continue; // degenerate segment (cannot happen with the offset level)
+        const inside = (c & CBIT[pick]) !== 0;
+        if ((pickSide > 0) === inside) next[ea] = eb; else next[eb] = ea;
       }
     }
   }

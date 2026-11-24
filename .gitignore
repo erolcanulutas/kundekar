@@ -36,3 +36,11 @@ scratch/
 *.log
 
 node_modules/
+
+# Local test images and screenshots (never commit)
+resim/
+SS/
+*.jpg
+*.jpeg
+*.png
+!public/**
