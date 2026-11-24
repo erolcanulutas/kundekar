@@ -101,7 +101,9 @@ export function prepare(inp: SimplifyInput): Prepared {
   // they don't bleed black into the image edges.
   for (let i = 0; i < n; i++) if (transparent[i]) { L[i] = woodLabs[0][0]; A[i] = woodLabs[0][1]; B[i] = woodLabs[0][2]; }
 
-  const blurR = Math.max(0, Math.round(detailPx * 0.35));
+  // Blur before the hard colour decision. An enlarged small image carries JPEG
+  // noise and pixel steps at the scale of its own pixels, so blur at that scale too.
+  const blurR = Math.max(0, Math.round(Math.max(detailPx * 0.35, inp.smoothing * inp.sourcePx * 0.8)));
   if (blurR > 0) for (const ch of [L, A, B]) boxBlur3(ch, w, h, blurR);
 
   // 2. Nearest wood
@@ -123,7 +125,7 @@ export function prepare(inp: SimplifyInput): Prepared {
   majority(labels, w, h, k);
   // Smooth on the scale of whichever is coarser: the bit's minimum feature or the
   // source image's own pixels (an enlarged small PNG has big blocky steps).
-  const smoothR = Math.round(inp.smoothing * Math.max(detailPx * 0.8, inp.sourcePx * 0.75));
+  const smoothR = Math.round(inp.smoothing * Math.max(detailPx * 0.8, inp.sourcePx * 1.1));
   if (smoothR >= 1) smoothLabels(labels, w, h, k, smoothR);
 
   // 4 + 5. Thin lines: opening, release, refill.

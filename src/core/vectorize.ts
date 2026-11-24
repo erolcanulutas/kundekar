@@ -11,7 +11,12 @@ export interface WoodOutline {
   loops: Float32Array[]; // each loop: x0,y0,x1,y1,... in mm, closed implicitly
 }
 
-export function vectorize(labels: Uint8Array, w: number, h: number, k: number, pxPerMm: number, skip0 = true): WoodOutline[] {
+/**
+ * blurPasses: how many 3x3 tent blurs smooth each mask before tracing
+ * (n passes ~ a Gaussian of sigma sqrt(n/2) px). More passes = smoother curves;
+ * keep sigma well under the thinnest line so thin parts don't vanish.
+ */
+export function vectorize(labels: Uint8Array, w: number, h: number, k: number, pxPerMm: number, skip0 = true, blurPasses = 1): WoodOutline[] {
   const out: WoodOutline[] = [];
   const W2 = w + 2, H2 = h + 2; // one pixel of zero padding closes loops at the border
   const f = new Float32Array(W2 * H2);
@@ -26,7 +31,7 @@ export function vectorize(labels: Uint8Array, w: number, h: number, k: number, p
       if (labels[y * w + x] === j) { f[(y + 1) * W2 + x + 1] = 1; any = true; }
     }
     if (!any) continue;
-    blur1(f, tmp, W2, H2);
+    for (let b = 0; b < blurPasses; b++) blur1(f, tmp, W2, H2);
     nextEdge.fill(-1);
     trace(f, W2, H2, nextEdge, ex, ey);
     const loops: Float32Array[] = [];
