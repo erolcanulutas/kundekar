@@ -1,5 +1,5 @@
 import "./style.css";
-import { derive, fmt, pxPerMm, SIZE_PRESETS, V_ANGLES, type Derived } from "./core/machine";
+import { DEFAULT_SETTINGS, derive, fmt, pxPerMm, SIZE_PRESETS, V_ANGLES, type Derived } from "./core/machine";
 import { paintSwatch, seedFor } from "./core/grain";
 import { planRounds, type SimplifyResult } from "./core/simplify";
 import {
@@ -14,7 +14,7 @@ import type { JobRequest, JobResponse } from "./worker";
 // ---------------------------------------------------------------- state
 
 type View = "original" | "woods" | "inlay";
-type Zoom = "fit" | "real";
+type Zoom = "fit" | "real" | "custom";
 
 interface Work { w: number; h: number; ppm: number; wMm: number; hMm: number; rgba: ImageData }
 interface Result { res: SimplifyResult; flat: ImageData; inlay: ImageData; ms: number }
@@ -27,6 +27,7 @@ let work: Work | null = null;
 let result: Result | null = null;
 let view: View = "inlay";
 let zoom: Zoom = "fit";
+let customScale = 1; // screen px per mm when zoom === "custom"
 let busy = false;
 let pending = false;
 let jobId = 0;
@@ -174,6 +175,7 @@ async function save() {
 
 async function loadProject(p: Project) {
   P = p;
+  P.settings = { ...DEFAULT_SETTINGS, ...p.settings }; // projects saved before a setting existed
   result = null;
   work = null;
   lastProjectId.set(p.id);
@@ -236,6 +238,8 @@ function runJob() {
     woods: allWoods().map((w) => ({ color: w.color, figure: w.figure, seed: seedFor(w.uid) })),
     minFeatureMm: d.minFeature,
     colorWeight: P.settings.colorWeight,
+    smoothing: P.settings.smoothing,
+    sourcePx: bitmap ? Math.max(1, work.w / bitmap.width) : 1,
   };
   worker.postMessage(req, [req.rgba.buffer]);
   updateStatus();
@@ -444,6 +448,9 @@ function renderSimplify(): string {
       <div class="field range"><label for="r-color">Match by</label><output class="mono" data-live="colorOut"></output>
         <input id="r-color" type="range" min="0" max="1.5" step="0.05" value="${s.colorWeight}" data-set="colorWeight" />
         <span class="hint">Left: light/dark only, like an engraving. Right: hue matters more.</span></div>
+      <div class="field range"><label for="r-smooth">Edge smoothing</label><output class="mono" data-live="smoothOut"></output>
+        <input id="r-smooth" type="range" min="0" max="1" step="0.05" value="${s.smoothing}" data-set="smoothing" />
+        <span class="hint">Rounds off jagged, pixel-stepped borders. Higher also softens sharp corners.</span></div>
     </div>
     <div class="sec"><h3>Wood usage</h3><div data-live="stats"></div></div>
     <div class="sec"><h3>Round plan <span>preview</span></h3><div data-live="rounds"></div></div>
@@ -478,6 +485,7 @@ function refreshLive() {
   }
 
   set("simplifyOut", `× ${fmt(P.settings.simplify, 1)} → ${fmt(d.minFeature, 1)} mm`);
+  set("smoothOut", P.settings.smoothing === 0 ? "off" : `${Math.round(P.settings.smoothing * 100)}%`);
   set("colorOut", P.settings.colorWeight < 0.15 ? "lightness" : P.settings.colorWeight > 0.9 ? "color" : "balanced");
 
   const woods = allWoods();
@@ -558,6 +566,7 @@ function renderStageShell() {
     </div>
     <div class="stage-scroll"></div>
     <div class="stage-foot"></div>`;
+  bindStageScroll();
   renderStage();
 }
 
@@ -590,17 +599,86 @@ function layoutStage() {
   const grid = $(".stage-grid");
   if (!scroll || !grid || !work) return;
   const R = 24;
-  const scale = zoom === "real"
-    ? cssPxPerMm
-    : Math.max(0.05, Math.min((scroll.clientWidth - R - 40) / work.wMm, (scroll.clientHeight - R - 40) / work.hMm));
+  const scale = currentScale();
   const W = Math.round(work.wMm * scale), H = Math.round(work.hMm * scale);
   grid.style.gridTemplateColumns = `${R}px ${W}px`;
   grid.style.gridTemplateRows = `${R}px ${H}px`;
-  grid.style.marginTop = zoom === "fit" ? `${Math.max(0, (scroll.clientHeight - H - R - 24) / 2)}px` : "0";
+  grid.style.marginTop = `${Math.max(0, (scroll.clientHeight - H - R - 24) / 2)}px`;
   const cv = $<HTMLCanvasElement>("canvas.view", grid)!;
   cv.style.width = W + "px"; cv.style.height = H + "px";
   drawRuler($<HTMLCanvasElement>("canvas.rx", grid)!, W, R, scale, true);
   drawRuler($<HTMLCanvasElement>("canvas.ry", grid)!, H, R, scale, false);
+}
+
+function fitScale(): number {
+  const scroll = $(".stage-scroll");
+  if (!scroll || !work) return 1;
+  return Math.max(0.05, Math.min((scroll.clientWidth - 24 - 40) / work.wMm, (scroll.clientHeight - 24 - 40) / work.hMm));
+}
+
+/** Largest zoom: ~4 screen px per image pixel, and rulers within canvas size limits. */
+function maxScale(): number {
+  if (!work) return 10;
+  const dpr = window.devicePixelRatio || 1;
+  return Math.min(work.ppm * 4, 30000 / dpr / Math.max(work.wMm, work.hMm));
+}
+
+function currentScale(): number {
+  if (zoom === "real") return cssPxPerMm;
+  if (zoom === "custom") return customScale;
+  return fitScale();
+}
+
+function setZoom(z: Zoom, scale?: number) {
+  zoom = z;
+  if (scale !== undefined) customScale = scale;
+  $$<HTMLButtonElement>("[data-zoom]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.zoom === zoom)));
+  layoutStage();
+  updateStatus();
+}
+
+/** Zoom by `factor`, keeping the image point under (clientX, clientY) in place. */
+function zoomAt(factor: number, clientX: number, clientY: number) {
+  const scroll = $(".stage-scroll"), cv = $<HTMLCanvasElement>("canvas.view");
+  if (!scroll || !cv || !work) return;
+  const s0 = currentScale();
+  const s1 = clamp(s0 * factor, Math.min(fitScale(), cssPxPerMm) * 0.5, maxScale());
+  if (Math.abs(s1 - s0) < 1e-6) return;
+  const r0 = cv.getBoundingClientRect();
+  const mx = (clientX - r0.left) / s0, my = (clientY - r0.top) / s0; // mm under the cursor
+  setZoom("custom", s1);
+  const r1 = cv.getBoundingClientRect();
+  scroll.scrollLeft += r1.left + mx * s1 - clientX;
+  scroll.scrollTop += r1.top + my * s1 - clientY;
+}
+
+function bindStageScroll() {
+  const scroll = $(".stage-scroll");
+  if (!scroll) return;
+  scroll.addEventListener("wheel", (e) => {
+    if (!work) return;
+    e.preventDefault();
+    const dy = e.deltaMode === 1 ? e.deltaY * 33 : e.deltaY; // lines -> px
+    zoomAt(Math.exp(-dy * 0.0015), e.clientX, e.clientY);
+  }, { passive: false });
+  // Drag to pan.
+  let drag: { x: number; y: number; sl: number; st: number; id: number } | null = null;
+  scroll.addEventListener("pointerdown", (e) => {
+    if (!work || (e.button !== 0 && e.button !== 1)) return;
+    if (!(e.target as Element).closest(".stage-grid")) return; // leave the scrollbars alone
+    drag = { x: e.clientX, y: e.clientY, sl: scroll.scrollLeft, st: scroll.scrollTop, id: e.pointerId };
+    scroll.setPointerCapture(e.pointerId);
+    scroll.classList.add("panning");
+  });
+  scroll.addEventListener("pointermove", (e) => {
+    if (!drag || e.pointerId !== drag.id) return;
+    scroll.scrollLeft = drag.sl - (e.clientX - drag.x);
+    scroll.scrollTop = drag.st - (e.clientY - drag.y);
+  });
+  const end = () => { drag = null; scroll.classList.remove("panning"); };
+  scroll.addEventListener("pointerup", end);
+  scroll.addEventListener("pointercancel", end);
+  scroll.addEventListener("dblclick", () => work && setZoom("fit"));
 }
 
 function drawRuler(c: HTMLCanvasElement, len: number, thick: number, scale: number, horiz: boolean) {
@@ -636,7 +714,7 @@ function updateStatus() {
   if (!work) { f.innerHTML = `<span>No image</span>`; return; }
   f.innerHTML = `<span>${fmt(work.wMm, 0)} × ${fmt(work.hMm, 0)} mm</span>
     <span>${work.w} × ${work.h} px · ${fmt(work.ppm, 2)} px/mm</span>
-    <span>${zoom === "real" ? `1:1 at ${fmt(cssPxPerMm, 2)} screen px/mm` : "fit to window"}</span>
+    <span>${zoom === "real" ? `1:1 real size` : zoom === "fit" ? "fit to window" : `${Math.round((100 * customScale) / cssPxPerMm)}% of real size`} · wheel to zoom, drag to pan, double-click to fit</span>
     ${busy ? `<span class="busy">processing</span>` : result ? `<span>processed in ${fmt(result.ms / 1000, 1)} s</span>` : ""}`;
 }
 
@@ -767,11 +845,7 @@ function bindShell() {
     const v = t.closest<HTMLElement>("[data-view]")?.dataset.view as View | undefined;
     if (v) { view = v; renderStage(); }
     const z = t.closest<HTMLElement>("[data-zoom]")?.dataset.zoom as Zoom | undefined;
-    if (z) {
-      zoom = z;
-      $$<HTMLButtonElement>("[data-zoom]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.zoom === zoom)));
-      layoutStage(); updateStatus();
-    }
+    if (z) setZoom(z);
     const act = t.closest<HTMLElement>("[data-act]")?.dataset.act;
     if (act === "calibrate") openCalibrate();
     if (act === "png") {
@@ -910,7 +984,7 @@ const reprepare = debounce(() => {
 function setSetting(key: keyof Project["settings"], v: number) {
   const limits: Record<keyof Project["settings"], [number, number]> = {
     widthMm: [20, 2000], vAngle: [10, 150], pocketDepth: [0.2, 10], glueGap: [0, 3],
-    surfacePerRound: [0, 2], minRetained: [0.05, 5], simplify: [1, 4], colorWeight: [0, 1.5],
+    surfacePerRound: [0, 2], minRetained: [0.05, 5], simplify: [1, 4], colorWeight: [0, 1.5], smoothing: [0, 1],
   };
   const [lo, hi] = limits[key];
   P.settings[key] = clamp(v, lo, hi);

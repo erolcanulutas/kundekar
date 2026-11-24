@@ -11,6 +11,7 @@ export interface MachineSettings {
   minRetained: number; // thinnest inlay edge still worth keeping, mm
   simplify: number; // multiplier on the minimum feature size (1 = finest possible)
   colorWeight: number; // 0 = match by lightness only, 1+ = match hue strongly
+  smoothing: number; // 0 = raw pixel edges, 1 = strongly rounded region borders
 }
 
 export const DEFAULT_SETTINGS: MachineSettings = {
@@ -22,6 +23,7 @@ export const DEFAULT_SETTINGS: MachineSettings = {
   minRetained: 0.5,
   simplify: 1.5,
   colorWeight: 0.35,
+  smoothing: 0.7,
 };
 
 export const SIZE_PRESETS: { label: string; widthMm: number }[] = [

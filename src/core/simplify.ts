@@ -17,6 +17,8 @@ export interface SimplifyInput {
   woodLabs: Lab[]; // index 0 = base wood
   minFeatureMm: number;
   colorWeight: number;
+  smoothing: number; // 0..1
+  sourcePx: number; // working pixels per source-image pixel (>1 when a small image is enlarged)
 }
 
 export interface WoodStat {
@@ -73,9 +75,13 @@ export function simplify(inp: SimplifyInput): SimplifyResult {
     labels[i] = best;
   }
 
-  // 3. Majority filter
+  // 3. Majority filter, then smooth region borders
   majority(labels, w, h, k);
   majority(labels, w, h, k);
+  // Smooth on the scale of whichever is coarser: the bit's minimum feature or the
+  // source image's own pixels (an enlarged small PNG has big blocky steps).
+  const smoothR = Math.round(inp.smoothing * Math.max(radiusPx * 0.8, inp.sourcePx * 0.75));
+  if (smoothR >= 1) smoothLabels(labels, w, h, k, smoothR);
 
   // 4 + 5. Opening, release, refill. Two passes: refilling can create new slivers.
   let released = 0;
@@ -87,6 +93,8 @@ export function simplify(inp: SimplifyInput): SimplifyResult {
       refill(labels, w, h, L, A, B, woodLabs, cw);
     }
   }
+  // Refill grows regions pixel by pixel; round those new borders off too.
+  if (smoothR >= 1) smoothLabels(labels, w, h, k, smoothR);
 
   return {
     labels,
@@ -130,6 +138,26 @@ function boxBlur3(ch: Float32Array, w: number, h: number, r: number) {
     boxBlur1(ch, tmp, w, h, r, true);
     boxBlur1(tmp, ch, w, h, r, false);
   }
+}
+
+/**
+ * Gaussian-smooth each wood's mask and give every pixel to the strongest one.
+ * Equivalent to a short curvature flow: staircases and jagged borders round off,
+ * corners soften by roughly r pixels, large shapes keep their position.
+ */
+function smoothLabels(labels: Uint8Array, w: number, h: number, k: number, r: number) {
+  const n = w * h;
+  const best = new Float32Array(n).fill(-1);
+  const out = labels.slice();
+  const ch = new Float32Array(n);
+  for (let j = 0; j < k; j++) {
+    let any = false;
+    for (let i = 0; i < n; i++) { const v = labels[i] === j ? 1 : 0; ch[i] = v; any ||= v === 1; }
+    if (!any) continue;
+    boxBlur3(ch, w, h, r);
+    for (let i = 0; i < n; i++) if (ch[i] > best[i]) { best[i] = ch[i]; out[i] = j; }
+  }
+  labels.set(out);
 }
 
 function majority(labels: Uint8Array, w: number, h: number, k: number) {

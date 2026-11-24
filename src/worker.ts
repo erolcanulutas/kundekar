@@ -12,6 +12,8 @@ export interface JobRequest {
   woods: RenderWood[];
   minFeatureMm: number;
   colorWeight: number;
+  smoothing: number;
+  sourcePx: number;
 }
 
 export interface JobResponse {
@@ -35,6 +37,8 @@ self.onmessage = (e: MessageEvent<JobRequest>) => {
       woodLabs: q.woods.map((w) => hexToLab(w.color)),
       minFeatureMm: q.minFeatureMm,
       colorWeight: q.colorWeight,
+      smoothing: q.smoothing,
+      sourcePx: q.sourcePx,
     });
     const flat = renderFlat(result.labels, q.width, q.height, q.woods);
     const inlay = renderInlay(result.labels, q.width, q.height, q.pxPerMm, q.woods);

@@ -231,7 +231,8 @@ table.stats th.n { text-align: right; }
 .stage-bar .btn { border-color: #8d7d66; color: #e9dfcd; }
 .stage-bar .btn:hover { background: #e9dfcd; color: var(--stage); }
 .stage-bar .spacer { flex: 1; }
-.stage-scroll { overflow: auto; position: relative; min-height: 0; }
+.stage-scroll { overflow: auto; position: relative; min-height: 0; cursor: grab; overscroll-behavior: contain; }
+.stage-scroll.panning { cursor: grabbing; user-select: none; }
 .stage-grid { display: grid; margin: 0 auto; width: max-content; padding: 0 24px 24px 0; }
 .stage-grid .corner { position: sticky; top: 0; left: 0; z-index: 3; background: var(--stage); font: 9px var(--mono); color: #8d7d66; display: grid; place-items: center; }
 .stage-grid .rx { position: sticky; top: 0; z-index: 2; background: var(--stage); }
