@@ -366,8 +366,16 @@ worker.onmessage = (e: MessageEvent<JobResponse>) => {
   else updateStatus();
 };
 
+/** The AI mask, its fixes and the hand edits all belong to one image. */
+function forgetImageWork() {
+  P.mask = null; P.maskOn = false; P.maskFixes = [];
+  P.edits = []; redo = [];
+  maskTool = null;
+}
+
 async function setImage(file: Blob, name: string) {
   if (!file.type.startsWith("image/")) { toast("That file is not an image."); return; }
+  forgetImageWork();
   P.image = file;
   P.imageName = name;
   P.log.push({ t: Date.now(), text: `Image: ${name}` });
@@ -1436,6 +1444,7 @@ function bindPanel() {
     }
     if (act === "clearImage") {
       P.image = null; P.imageName = null; result = null;
+      forgetImageWork();
       prepareImage().then(() => { touch(true); renderAll(); });
       return;
     }
