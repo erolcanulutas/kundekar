@@ -208,6 +208,8 @@ async function loadProject(p: Project) {
     // Before v0.2 the line width was "bit limit × simplification".
     P.settings.minLineMm = Math.round(derive(P.settings, P.base, P.tones).minFeatureFine * old.simplify * 10) / 10;
   }
+  // The "match by" slider became a two-way choice: snap old in-between values.
+  P.settings.colorWeight = P.settings.colorWeight >= 0.5 ? 1 : 0;
   P.edits ??= [];
   P.mask ??= null;
   P.maskOn ??= false;
@@ -596,9 +598,12 @@ function renderSimplify(): string {
       <div class="field range"><label for="r-area">Smallest area</label><output class="mono" data-live="areaOut"></output>
         <input id="r-area" type="range" min="0" max="100" step="0.5" value="${s.minAreaMm2}" data-set="minAreaMm2" />
         <span class="hint">Dots and islands smaller than this are filled by the wood around them.</span></div>
-      <div class="field range"><label for="r-color">Match by</label><output class="mono" data-live="colorOut"></output>
-        <input id="r-color" type="range" min="0" max="1.5" step="0.05" value="${s.colorWeight}" data-set="colorWeight" />
-        <span class="hint">Left: light/dark only, like an engraving. Right: hue matters more.</span></div>
+      <div class="field"><label>Match by</label>
+        <span class="seg" role="group" aria-label="Match by">
+          <button data-match="0" aria-pressed="${s.colorWeight < 0.5}">Light &amp; dark</button><button data-match="1" aria-pressed="${s.colorWeight >= 0.5}">Color</button></span>
+        <span class="hint">${s.colorWeight < 0.5
+          ? "For photos and portraits: dark parts get the dark woods, light parts the light woods. Every wood gets its own band of lightness."
+          : "For colourful drawings: each area gets the wood closest in colour. Woods with no matching colour in the image stay unused."}</span></div>
       <div class="field range"><label for="r-smooth">Edge smoothing</label><output class="mono" data-live="smoothOut"></output>
         <input id="r-smooth" type="range" min="0" max="1" step="0.05" value="${s.smoothing}" data-set="smoothing" />
         <span class="hint">Rounds off jagged, pixel-stepped borders. Higher also softens sharp corners.</span></div>
@@ -705,7 +710,6 @@ function refreshLive() {
     : `${fmt(P.settings.minLineMm, 1)} mm`);
   set("areaOut", P.settings.minAreaMm2 <= 0 ? "off" : `${fmt(P.settings.minAreaMm2, 1)} mm² (⌀ ${fmt(2 * Math.sqrt(P.settings.minAreaMm2 / Math.PI), 1)} mm)`);
   set("smoothOut", P.settings.smoothing === 0 ? "off" : `${Math.round(P.settings.smoothing * 100)}%`);
-  set("colorOut", P.settings.colorWeight < 0.15 ? "lightness" : P.settings.colorWeight > 0.9 ? "color" : "balanced");
 
   const woods = allWoods();
   if (!work) {
@@ -1393,6 +1397,8 @@ function bindPanel() {
       sizeChanged(true);
       return;
     }
+    const match = t.closest<HTMLElement>("[data-match]")?.dataset.match;
+    if (match !== undefined) { P.settings.colorWeight = Number(match); touch(true); renderPanel(); return; }
     const mode = t.closest<HTMLElement>("[data-sizemode]")?.dataset.sizemode as SizeMode | undefined;
     if (mode) { P.settings.sizeMode = mode; sizeChanged(true); return; }
     const fit = t.closest<HTMLElement>("[data-fit]")?.dataset.fit as FitMode | undefined;
@@ -1590,7 +1596,7 @@ function sizeChanged(rerender: boolean) {
 function setSetting(key: NumericSetting, v: number) {
   const limits: Record<NumericSetting, [number, number]> = {
     widthMm: [20, 2000], heightMm: [20, 2000], marginMm: [0, 200], imgX: [-5000, 5000], imgY: [-5000, 5000], imgWidthMm: [5, 5000], vAngle: [10, 150], pocketDepth: [0.2, 10], glueGap: [0, 3],
-    surfacePerRound: [0, 2], minRetained: [0.05, 5], minLineMm: [0, 10], minAreaMm2: [0, 100], colorWeight: [0, 1.5], smoothing: [0, 1],
+    surfacePerRound: [0, 2], minRetained: [0.05, 5], minLineMm: [0, 10], minAreaMm2: [0, 100], colorWeight: [0, 1], smoothing: [0, 1],
   };
   const [lo, hi] = limits[key];
   P.settings[key] = clamp(v, lo, hi);

@@ -21,7 +21,7 @@ export interface MachineSettings {
   minRetained: number; // thinnest inlay edge still worth keeping, mm
   minLineMm: number; // thinnest line / narrowest region kept (never below what the bit can hold)
   minAreaMm2: number; // islands smaller than this are filled by the surrounding wood
-  colorWeight: number; // 0 = match by lightness only, 1+ = match hue strongly
+  colorWeight: number; // 0 = "Light & dark" (lightness only), 1 = "Color" (full perceptual distance)
   smoothing: number; // 0 = raw pixel edges, 1 = strongly rounded region borders
 }
 
@@ -43,7 +43,7 @@ export const DEFAULT_SETTINGS: MachineSettings = {
   minRetained: 0.5,
   minLineMm: 2,
   minAreaMm2: 4,
-  colorWeight: 0.35,
+  colorWeight: 0,
   smoothing: 0.7,
 };
 
