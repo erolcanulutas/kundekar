@@ -7,13 +7,17 @@
 
 type Segmenter = (input: string) => Promise<{ data: Uint8ClampedArray; width: number; height: number; channels: number }>;
 
+const TRANSFORMERS_URL = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.2";
+
 let segmenter: Promise<Segmenter> | null = null;
 
 export async function removeBackground(image: Blob, onStatus: (text: string) => void): Promise<Blob> {
   if (!segmenter) {
     onStatus("Loading the AI library…");
     segmenter = (async () => {
-      const { pipeline } = await import("@huggingface/transformers");
+      // Loaded from the CDN rather than bundled: keeps the site small, and GitHub's
+      // secret scanning flags a false positive inside the minified library.
+      const { pipeline } = await import(/* @vite-ignore */ TRANSFORMERS_URL);
       const files: Record<string, { loaded: number; total: number }> = {};
       const pipe = await pipeline("background-removal", "onnx-community/ormbg-ONNX", {
         dtype: "q8",
