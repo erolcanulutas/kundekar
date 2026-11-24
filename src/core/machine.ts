@@ -3,7 +3,7 @@
 import type { Wood } from "./woods";
 
 export type SizeMode = "image" | "board"; // height follows the image, or the board is entered
-export type FitMode = "contain" | "cover" | "stretch";
+export type FitMode = "contain" | "cover" | "stretch" | "custom";
 
 export interface MachineSettings {
   widthMm: number; // base board width
@@ -11,6 +11,9 @@ export interface MachineSettings {
   marginMm: number; // plain base-wood border around the artwork
   sizeMode: SizeMode;
   fit: FitMode; // how the image sits on an entered board
+  imgX: number; // "custom" placement: image top-left on the board, mm
+  imgY: number;
+  imgWidthMm: number; // "custom" placement: image width, mm (height keeps the image's proportions)
   vAngle: number; // included angle of the V-bit, degrees
   pocketDepth: number; // mm
   glueGap: number; // extra plug depth so the plug bottoms out on the walls, mm
@@ -29,6 +32,9 @@ export const DEFAULT_SETTINGS: MachineSettings = {
   marginMm: 0,
   sizeMode: "image",
   fit: "contain",
+  imgX: 0,
+  imgY: 0,
+  imgWidthMm: 0,
   vAngle: 90,
   pocketDepth: 2,
   glueGap: 0.5,
@@ -60,7 +66,10 @@ export function boardLayout(s: MachineSettings, imgW: number, imgH: number): { w
   }
   const art = { x: m, y: m, w: Math.max(1, s.widthMm - 2 * m), h: Math.max(1, s.heightMm - 2 * m) };
   if (s.fit === "stretch") return { wMm: s.widthMm, hMm: s.heightMm, art, draw: art };
-  const k = s.fit === "contain" ? Math.min(art.w / imgW, art.h / imgH) : Math.max(art.w / imgW, art.h / imgH);
+  if (s.fit === "custom" && s.imgWidthMm > 0) {
+    return { wMm: s.widthMm, hMm: s.heightMm, art, draw: { x: s.imgX, y: s.imgY, w: s.imgWidthMm, h: s.imgWidthMm * ar } };
+  }
+  const k = s.fit === "cover" ? Math.max(art.w / imgW, art.h / imgH) : Math.min(art.w / imgW, art.h / imgH); // "custom" not yet sized: start as Fit
   const dw = imgW * k, dh = imgH * k;
   return { wMm: s.widthMm, hMm: s.heightMm, art, draw: { x: art.x + (art.w - dw) / 2, y: art.y + (art.h - dh) / 2, w: dw, h: dh } };
 }

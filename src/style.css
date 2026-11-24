@@ -240,6 +240,15 @@ table.stats th.n { text-align: right; }
 .stage-grid .viewbox { position: relative; box-shadow: 0 14px 40px rgba(0, 0, 0, 0.55); background: #3a3128; }
 .stage-grid canvas.view { display: block; width: 100%; height: 100%; }
 .stage-grid canvas.vec { position: absolute; display: none; pointer-events: none; }
+.artbox { position: absolute; display: none; pointer-events: none; outline: 1px dashed rgba(35, 28, 21, 0.55); }
+.placer { position: absolute; display: none; cursor: move; outline: 2px dashed #1c6b66; outline-offset: -1px; touch-action: none; }
+.placer:hover { background: rgba(28, 107, 102, 0.08); }
+.placer i { position: absolute; width: 14px; height: 14px; background: #f7f1e5; border: 2px solid #1c6b66; border-radius: 2px; }
+.placer i[data-h="nw"] { left: -8px; top: -8px; cursor: nwse-resize; }
+.placer i[data-h="se"] { right: -8px; bottom: -8px; cursor: nwse-resize; }
+.placer i[data-h="ne"] { right: -8px; top: -8px; cursor: nesw-resize; }
+.placer i[data-h="sw"] { left: -8px; bottom: -8px; cursor: nesw-resize; }
+.pl-dim { position: absolute; left: 50%; bottom: -26px; transform: translateX(-50%); background: #1c6b66; color: #fff; font: 11px var(--mono); padding: 2px 7px; border-radius: 2px; white-space: nowrap; pointer-events: none; }
 .stage-empty { display: grid; place-items: center; height: 100%; text-align: center; padding: 40px; color: #b5a68e; }
 .stage-empty svg { width: 120px; opacity: 0.5; margin-bottom: 14px; }
 .stage-empty h3 { font-size: 22px; color: #e9dfcd; margin-bottom: 6px; }

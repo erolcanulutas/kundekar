@@ -423,6 +423,7 @@ function renderImage(): string {
     ["contain", "Fit", "Whole image visible; leftover space becomes base wood."],
     ["cover", "Fill", "Image fills the board; the overflow is cropped."],
     ["stretch", "Stretch", "Image is distorted to the board's proportions."],
+    ["custom", "Free", "Your own size and position. Drag the image on the preview; drag a corner to resize."],
   ];
   return `${head(1, "Image & size", "Detailed artwork is welcome: it will be reduced to your woods in step 4. Size the base board to match the image, or enter your board and place the image on it.")}
     <div class="sec"><h3>Artwork</h3>${img}<input type="file" id="imageFile" accept="image/*" hidden /></div>
@@ -436,10 +437,17 @@ function renderImage(): string {
         <span class="hint">${board ? `<button class="btn small ghost" data-act="swapWH">⇄ Swap width and height</button>` : "Follows the image's proportions."}</span></div>
       <div class="field"><label for="f-marginMm">Border</label><span><input id="f-marginMm" type="number" min="0" max="200" step="1" value="${s.marginMm}" data-set="marginMm" /><span class="unit">mm</span></span>
         <span class="hint">Plain base wood around the artwork, e.g. room for registration pins.</span></div>
+      ${board ? "" : `<p class="muted" style="font-size:12.5px;margin:4px 0 0">To resize or move the image on a board of fixed size, choose <b>Enter board size</b>.</p>`}
     </div>
     ${board ? `<div class="sec"><h3>Image on the board</h3>
       <div class="field"><span class="seg" role="group" aria-label="Image placement">${fits.map(([f, l]) => `<button data-fit="${f}" aria-pressed="${s.fit === f}">${l}</button>`).join("")}</span>
-      <span class="hint">${fits.find((f) => f[0] === s.fit)![2]}</span></div></div>` : ""}
+      <span class="hint">${fits.find((f) => f[0] === s.fit)![2]}</span></div>
+      <div class="field"><label for="f-imgWidthMm">Image width</label><span><input id="f-imgWidthMm" type="number" min="5" max="5000" step="1" data-place="imgWidthMm" /><span class="unit">mm</span></span>
+        <span class="hint" data-live="imgHOut"></span></div>
+      <div class="field"><label for="f-imgX">From left</label><span><input id="f-imgX" type="number" min="-5000" max="5000" step="1" data-place="imgX" /><span class="unit">mm</span></span></div>
+      <div class="field"><label for="f-imgY">From top</label><span><input id="f-imgY" type="number" min="-5000" max="5000" step="1" data-place="imgY" /><span class="unit">mm</span></span></div>
+      <p style="margin:0"><button class="btn small" data-act="centerImg">Center on board</button></p>
+    </div>` : ""}
     <div class="sec"><h3>Result</h3><dl class="readout" data-live="size"></dl></div>`;
 }
 
@@ -519,6 +527,7 @@ function refreshLive() {
     set("size", `<dt class="muted">Add an image to see the board layout.</dt><dd></dd>`);
   }
 
+  syncPlacementFields();
   set("simplifyOut", `× ${fmt(P.settings.simplify, 1)} → ${fmt(d.minFeature, 1)} mm`);
   set("smoothOut", P.settings.smoothing === 0 ? "off" : `${Math.round(P.settings.smoothing * 100)}%`);
   set("colorOut", P.settings.colorWeight < 0.15 ? "lightness" : P.settings.colorWeight > 0.9 ? "color" : "balanced");
@@ -622,13 +631,25 @@ function renderStage() {
   }
   if (!$("canvas.view", scroll)) {
     scroll.innerHTML = `<div class="stage-grid"><div class="corner">mm</div><canvas class="rx"></canvas><canvas class="ry"></canvas>
-      <div class="viewbox"><canvas class="view"></canvas><canvas class="vec" aria-hidden="true"></canvas></div></div>`;
+      <div class="viewbox"><canvas class="view"></canvas><canvas class="vec" aria-hidden="true"></canvas>
+        <div class="artbox"></div>
+        <div class="placer" title="Drag to move · drag a corner to resize"><i data-h="nw"></i><i data-h="ne"></i><i data-h="sw"></i><i data-h="se"></i><span class="pl-dim"></span></div>
+      </div></div>`;
+    bindPlacer();
   }
   const cv = $<HTMLCanvasElement>("canvas.view", scroll)!;
   cv.width = work.w; cv.height = work.h;
   const ctx = cv.getContext("2d")!;
-  const img = view === "original" || !result ? work.rgba : view === "woods" ? result.flat : result.inlay;
-  ctx.putImageData(img, 0, 0);
+  if (view === "original" || !result) {
+    // Show the board in its base wood, with the image on top.
+    const tmp = new OffscreenCanvas(work.w, work.h);
+    tmp.getContext("2d")!.putImageData(work.rgba, 0, 0);
+    ctx.fillStyle = P.base.color;
+    ctx.fillRect(0, 0, work.w, work.h);
+    ctx.drawImage(tmp, 0, 0);
+  } else {
+    ctx.putImageData(view === "woods" ? result.flat : result.inlay, 0, 0);
+  }
   layoutStage();
   updateStatus();
 }
@@ -648,6 +669,90 @@ function layoutStage() {
   drawRuler($<HTMLCanvasElement>("canvas.rx", grid)!, W, R, scale, true);
   drawRuler($<HTMLCanvasElement>("canvas.ry", grid)!, H, R, scale, false);
   drawVector();
+  positionPlacer();
+}
+
+// ---- Image placement on a board of fixed size
+
+function placement() {
+  return bitmap ? boardLayout(P.settings, bitmap.width, bitmap.height) : null;
+}
+
+/** Switch to free placement, starting from wherever the image is now. */
+function toCustom() {
+  const g = placement();
+  if (!g || (P.settings.fit === "custom" && P.settings.imgWidthMm > 0)) return;
+  Object.assign(P.settings, { fit: "custom", imgX: g.draw.x, imgY: g.draw.y, imgWidthMm: g.draw.w });
+  $$<HTMLButtonElement>("[data-fit]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.fit === "custom")));
+}
+
+function positionPlacer() {
+  const placer = $(".placer"), artbox = $(".artbox");
+  const g = placement();
+  const show = !!(g && work && P.step === "image" && view === "original");
+  if (artbox) artbox.style.display = show && P.settings.marginMm > 0 ? "block" : "none";
+  if (placer) placer.style.display = show && P.settings.sizeMode === "board" ? "block" : "none";
+  if (!show || !g) return;
+  const s = currentScale();
+  const box = (el: HTMLElement | null, r: { x: number; y: number; w: number; h: number }) => {
+    if (el) Object.assign(el.style, { left: `${r.x * s}px`, top: `${r.y * s}px`, width: `${r.w * s}px`, height: `${r.h * s}px` });
+  };
+  box(artbox, g.art);
+  box(placer, g.draw);
+  const dim = $(".pl-dim");
+  if (dim) dim.textContent = `${fmt(g.draw.w, 0)} × ${fmt(g.draw.h, 0)} mm`;
+}
+
+function syncPlacementFields() {
+  const g = placement();
+  if (!g) return;
+  const vals: Record<string, number> = { imgWidthMm: g.draw.w, imgX: g.draw.x, imgY: g.draw.y };
+  $$<HTMLInputElement>("[data-place]").forEach((el) => {
+    if (document.activeElement !== el) el.value = fmt(vals[el.dataset.place!], 1);
+  });
+  $$("[data-live=\"imgHOut\"]").forEach((el) => (el.textContent = `Height ${fmt(g.draw.h, 1)} mm (keeps the image's proportions)`));
+}
+
+let liveFrame = 0;
+/** Re-draw the original view right away; processing follows after a pause. */
+function placementChanged() {
+  if (!liveFrame) liveFrame = requestAnimationFrame(() => { liveFrame = 0; prepareWork(); renderStage(); syncPlacementFields(); });
+  touch(false);
+  reprepare();
+}
+
+function bindPlacer() {
+  const placer = $(".placer");
+  if (!placer) return;
+  let d: { h: string; x0: number; y0: number; x: number; y: number; w: number; ar: number; id: number } | null = null;
+  placer.addEventListener("pointerdown", (e) => {
+    if (!bitmap) return;
+    e.stopPropagation();
+    e.preventDefault();
+    toCustom();
+    const s = P.settings;
+    d = { h: (e.target as HTMLElement).dataset.h ?? "move", x0: e.clientX, y0: e.clientY, x: s.imgX, y: s.imgY, w: s.imgWidthMm, ar: bitmap.height / bitmap.width, id: e.pointerId };
+    placer.setPointerCapture(e.pointerId);
+  });
+  placer.addEventListener("pointermove", (e) => {
+    if (!d || e.pointerId !== d.id) return;
+    const sc = currentScale(), dx = (e.clientX - d.x0) / sc, dy = (e.clientY - d.y0) / sc;
+    const s = P.settings, h0 = d.w * d.ar;
+    if (d.h === "move") { s.imgX = d.x + dx; s.imgY = d.y + dy; }
+    else {
+      const sx = d.h.includes("e") ? 1 : -1, sy = d.h.includes("s") ? 1 : -1;
+      const w = Math.max(5, d.w + (sx * dx + (sy * dy) / d.ar) / 2); // proportional
+      const h = w * d.ar;
+      s.imgWidthMm = w;
+      s.imgX = sx > 0 ? d.x : d.x + d.w - w; // the opposite corner stays put
+      s.imgY = sy > 0 ? d.y : d.y + h0 - h;
+    }
+    positionPlacer();
+    placementChanged();
+  });
+  const end = () => { if (d) { d = null; renderPanel(); } };
+  placer.addEventListener("pointerup", end);
+  placer.addEventListener("pointercancel", end);
 }
 
 // ---- Vector preview: only the visible part is drawn, at screen resolution,
@@ -1013,13 +1118,25 @@ function bindPanel() {
     const mode = t.closest<HTMLElement>("[data-sizemode]")?.dataset.sizemode as SizeMode | undefined;
     if (mode) { P.settings.sizeMode = mode; sizeChanged(true); return; }
     const fit = t.closest<HTMLElement>("[data-fit]")?.dataset.fit as FitMode | undefined;
-    if (fit) { P.settings.fit = fit; sizeChanged(true); return; }
+    if (fit) {
+      if (fit === "custom") toCustom(); else P.settings.fit = fit;
+      sizeChanged(true);
+      return;
+    }
     const angle = t.closest<HTMLElement>("[data-angle]")?.dataset.angle;
     if (angle) { setSetting("vAngle", Number(angle)); renderPanel(); return; }
 
     const act = t.closest<HTMLElement>("[data-act]")?.dataset.act;
     if (!act) return;
     if (act === "pick") { $<HTMLInputElement>("#imageFile")?.click(); return; }
+    if (act === "centerImg") {
+      toCustom();
+      const g = placement();
+      if (g) { P.settings.imgX = (g.wMm - g.draw.w) / 2; P.settings.imgY = (g.hMm - g.draw.h) / 2; }
+      placementChanged();
+      renderPanel();
+      return;
+    }
     if (act === "swapWH") {
       [P.settings.widthMm, P.settings.heightMm] = [P.settings.heightMm, P.settings.widthMm];
       sizeChanged(true);
@@ -1072,6 +1189,21 @@ function bindPanel() {
 
   panel.oninput = (e) => {
     const t = e.target as HTMLInputElement;
+    const place = t.dataset.place as "imgWidthMm" | "imgX" | "imgY" | undefined;
+    if (place) {
+      const v = Number(t.value);
+      if (t.value === "" || !Number.isFinite(v)) return;
+      toCustom();
+      const s = P.settings;
+      if (place === "imgWidthMm") {
+        const g = placement()!;
+        const cx = g.draw.x + g.draw.w / 2, cy = g.draw.y + g.draw.h / 2, ar = g.draw.h / g.draw.w;
+        s.imgWidthMm = clamp(v, 5, 5000);
+        s.imgX = cx - s.imgWidthMm / 2; s.imgY = cy - (s.imgWidthMm * ar) / 2; // resize around the centre
+      } else s[place] = clamp(v, -5000, 5000);
+      placementChanged();
+      return;
+    }
     const key = t.dataset.set as NumericSetting | undefined;
     if (key) {
       const v = Number(t.value);
@@ -1124,7 +1256,7 @@ function sizeChanged(rerender: boolean) {
 
 function setSetting(key: NumericSetting, v: number) {
   const limits: Record<NumericSetting, [number, number]> = {
-    widthMm: [20, 2000], heightMm: [20, 2000], marginMm: [0, 200], vAngle: [10, 150], pocketDepth: [0.2, 10], glueGap: [0, 3],
+    widthMm: [20, 2000], heightMm: [20, 2000], marginMm: [0, 200], imgX: [-5000, 5000], imgY: [-5000, 5000], imgWidthMm: [5, 5000], vAngle: [10, 150], pocketDepth: [0.2, 10], glueGap: [0, 3],
     surfacePerRound: [0, 2], minRetained: [0.05, 5], simplify: [1, 4], colorWeight: [0, 1.5], smoothing: [0, 1],
   };
   const [lo, hi] = limits[key];
