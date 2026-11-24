@@ -2,7 +2,8 @@ import "./style.css";
 import {
   boardLayout, DEFAULT_SETTINGS, derive, fmt, pxPerMm, SIZE_PRESETS, V_ANGLES, type Derived, type FitMode, type NumericSetting, type SizeMode,
 } from "./core/machine";
-import { loopToPath2D, loopToSvg, type WoodOutline } from "./core/vectorize";
+import { blurPassesFor, loopToPath2D, loopToSvg, type WoodOutline } from "./core/vectorize";
+import { buildRounds, type RoundShape } from "./core/rounds";
 import type { Edit, PxEdit } from "./core/edits";
 import { removeBackground } from "./ai";
 import { paintSeamlessTile, paintSwatch, seedFor } from "./core/grain";
@@ -138,12 +139,13 @@ const STEPS: Step[] = [
   },
   {
     id: "refine", title: "Refine", sub: "Fix regions by hand", phase: "Setup", view: "woods",
-    blocker: () => "Rounds (step 6) is not built yet: it is the next milestone (MVP 2). Your setup is saved.",
+    blocker: () => (result ? null : "Wait for the preview to finish."),
     render: renderRefine,
   },
   {
     id: "rounds", title: "Rounds", sub: "Pocket · plug · glue · surface", phase: "Workshop", view: "inlay",
-    blocker: () => "Not built yet.", render: () => "",
+    blocker: () => "Last step. Native G-code is the next milestone (MVP 3); until then, cut the SVG files in your CAM.",
+    render: renderRounds,
   },
 ];
 
@@ -153,13 +155,13 @@ function stepIndex(id = P.step) {
 
 /** A step can be opened when every step before it can be left. */
 function reachable(i: number): boolean {
-  if (STEPS[i].id === "rounds") return false;
-  for (let j = 0; j < i; j++) if (STEPS[j].blocker() && STEPS[j].id !== "refine") return false;
+  for (let j = 0; j < i; j++) if (STEPS[j].blocker()) return false;
   return true;
 }
 
 function goTo(id: string) {
   P.step = id;
+  if (id === "rounds") { const plan = roundPlan(); if (plan) selRound = firstOpenRound(plan.shapes); }
   view = STEPS[stepIndex()].view;
   if (!result && view !== "original") view = "original";
   touch(false);
@@ -363,6 +365,13 @@ worker.onmessage = (e: MessageEvent<JobResponse>) => {
     renderStage();
     clearInk();
     refreshLive();
+    renderRail(); // steps that needed a result may have become reachable
+    renderFoot();
+    if (P.step === "rounds") {
+      const plan = roundPlan();
+      if (firstResult && plan) { selRound = firstOpenRound(plan.shapes); drawVector(); }
+      renderPanel();
+    }
   }
   if (pending) runJob();
   else updateStatus();
@@ -445,7 +454,7 @@ function renderFoot() {
     <button class="btn" data-act="back" ${i === 0 ? "disabled" : ""}>← Back</button>
     <span class="where">Step ${i + 1} of ${STEPS.length}</span>
     <span class="why">${blocker ? esc(blocker) : ""}</span>
-    <button class="btn primary" data-act="next" ${blocker ? "disabled" : ""}>Next: ${STEPS[i + 1]?.title ?? ""} →</button>`;
+    ${STEPS[i + 1] ? `<button class="btn primary" data-act="next" ${blocker ? "disabled" : ""}>Next: ${STEPS[i + 1].title} →</button>` : ""}`;
 }
 
 function renderPanel() {
@@ -671,6 +680,141 @@ function redoEdit() {
   P.edits.push(e);
   touch(false); scheduleProcess(0);
   if (P.step === "refine") renderPanel();
+}
+
+// ---------------------------------------------------------------- rounds
+
+let selRound = 0;
+let roundCache: { of: Result; shapes: RoundShape[]; pocketPaths: Path2D[] } | null = null;
+
+/** Round order and the pocket / plug shapes, computed once per result. */
+function roundPlan() {
+  if (!result || !work) return null;
+  if (roundCache?.of === result) return roundCache;
+  const d = derive(P.settings, P.base, P.tones);
+  const order = planRounds(result.res.adjacency, result.res.stats);
+  const shapes = buildRounds(result.res.labels, work.w, work.h, allWoods().length, work.ppm, order,
+    blurPassesFor(d.minFeature, work.ppm, P.settings.smoothing));
+  const pocketPaths = shapes.map((r) => { const p = new Path2D(); r.pocket.forEach((l) => loopToPath2D(p, l)); return p; });
+  roundCache = { of: result, shapes, pocketPaths };
+  return roundCache;
+}
+
+function roundTasks(i: number, r: RoundShape): string[] {
+  const woods = allWoods();
+  return [`r${i}:pocket`, ...r.plugs.map((p) => `r${i}:plug:${woods[p.wood].uid}`), `r${i}:glue`, `r${i}:surface`];
+}
+
+function firstOpenRound(shapes: RoundShape[]): number {
+  const i = shapes.findIndex((r, n) => roundTasks(n, r).some((k) => !P.done[k]));
+  return i < 0 ? Math.max(0, shapes.length - 1) : i;
+}
+
+const when = (t: number) => new Date(t).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" });
+
+function cureText(i: number): string {
+  const glued = P.done[`r${i}:glue`];
+  const hrs = P.settings.cureHours;
+  if (!glued) return `Let the glue cure ${fmt(hrs, 1)} h before surfacing.`;
+  const ready = glued + hrs * 3600e3, left = ready - Date.now();
+  if (left <= 0) return `Glued ${when(glued)}. Cured: ready to surface.`;
+  const mins = Math.ceil(left / 60e3);
+  return `Glued ${when(glued)}. Ready ${when(ready)} (in ${Math.floor(mins / 60)} h ${mins % 60} min).`;
+}
+setInterval(() => {
+  if (P?.step === "rounds") $$<HTMLElement>("[data-cure]").forEach((el) => (el.textContent = cureText(Number(el.dataset.cure))));
+}, 30000);
+
+function bbox(loops: Float32Array[]) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const l of loops) for (let i = 0; i < l.length; i += 2) {
+    x0 = Math.min(x0, l[i]); x1 = Math.max(x1, l[i]); y0 = Math.min(y0, l[i + 1]); y1 = Math.max(y1, l[i + 1]);
+  }
+  return { x0, y0, x1, y1 };
+}
+
+function renderRounds(): string {
+  const plan = roundPlan();
+  const intro = head(6, "Rounds", "Each round: cut the pocket, cut the mirrored plug, glue, let it cure, surface flat. Tick each step as you go; progress is saved, so you can come back tomorrow.");
+  if (!plan) return `${intro}<div class="sec"><p class="muted busy">Preparing the plan</p></div>`;
+  const { shapes } = plan;
+  if (!shapes.length) return `${intro}<div class="sec"><p>Only the base wood is left, so there is nothing to inlay. Lower the thinnest line or smallest area in step 4.</p></div>`;
+  if (selRound >= shapes.length) selRound = firstOpenRound(shapes);
+  const s = P.settings, woods = allWoods(), T = P.base.thickness, n = shapes.length;
+  const D = s.pocketDepth, sr = s.surfacePerRound, plugD = D + s.glueGap;
+  const tick = (key: string, title: string, body: string, extra = "") => `
+    <li class="task ${P.done[key] ? "done" : ""}"><label><input type="checkbox" data-task="${key}" ${P.done[key] ? "checked" : ""} /> <b>${title}</b></label>
+      <div class="tdesc">${body}</div>${extra}</li>`;
+  const cards = shapes.map((r, i) => {
+    const keys = roundTasks(i, r), doneN = keys.filter((k) => P.done[k]).length;
+    const state = doneN === keys.length ? "✓ done" : doneN ? `${doneN} / ${keys.length}` : i === firstOpenRound(shapes) ? "next" : "";
+    const names = r.woods.map((j) => `<span><span class="dot" style="background:${woods[j].color}"></span>${esc(woods[j].name)}</span>`).join(" ");
+    const head = `<button class="rhead" data-round="${i}" aria-expanded="${i === selRound}"><span class="rn">R${i + 1}</span><span class="rw">${names}</span><span class="rs">${state}</span></button>`;
+    if (i !== selRound) return `<section class="round ${doneN === keys.length ? "done" : ""}">${head}</section>`;
+    const b = bbox(r.pocket);
+    const top = T - i * sr;
+    const plugs = r.plugs.map((p) => {
+      const w = woods[p.wood];
+      return tick(`r${i}:plug:${w.uid}`, `Cut the ${esc(w.name)} plug (mirrored)`,
+        `From a ${fmt(w.thickness)} mm ${esc(w.name)} board at least <b>${fmt(p.w, 0)} × ${fmt(p.h, 0)} mm</b>. V-bit ${s.vAngle}°, plug depth <b>${fmt(plugD)} mm</b> (pocket + ${fmt(s.glueGap)} mm glue gap). ${fmt(p.areaMm2 / 100, 1)} cm².`,
+        `<p class="tfiles"><button class="btn small" data-dl="plug:${i}:${p.wood}">↓ Plug SVG</button></p>`);
+    }).join("");
+    return `<section class="round sel ${doneN === keys.length ? "done" : ""}">${head}
+      <ol class="tasks">
+        ${tick(`r${i}:pocket`, `Cut the pocket into the ${esc(P.base.name)}`,
+          `V-bit ${s.vAngle}°, <b>${fmt(D)} mm deep</b> from the current top (${fmt(top)} mm thick): Z <b>${fmt(-(i * sr + D))}</b> from the original top. ${fmt(r.pocketAreaMm2 / 100, 1)} cm², from X ${fmt(b.x0, 0)}–${fmt(b.x1, 0)} and Y ${fmt(b.y0, 0)}–${fmt(b.y1, 0)} mm (board's top-left corner).`,
+          `<p class="tfiles"><button class="btn small" data-dl="pocket:${i}">↓ Pocket SVG</button></p>`)}
+        ${plugs}
+        ${tick(`r${i}:glue`, `Glue the plug${r.plugs.length > 1 ? "s" : ""} in and clamp`, `<span data-cure="${i}">${cureText(i)}</span>`)}
+        ${tick(`r${i}:surface`, "Surface flat",
+          `Down to Z <b>${fmt(-(i + 1) * sr)}</b> from the original top: removes the plug's excess and ${fmt(sr)} mm of the base. The board is then ${fmt(T - (i + 1) * sr)} mm thick.`)}
+      </ol></section>`;
+  }).join("");
+  const d = derive(s, P.base, P.tones);
+  return `${intro}
+    <div class="sec"><h3>Plan <span>${n} round${n === 1 ? "" : "s"}</span></h3>
+      <dl class="readout">
+        <dt>Base after the last round</dt><dd>${fmt(T - n * sr)} mm</dd>
+        <dt>Depth the first inlay keeps</dt><dd>≈ ${fmt(D - n * sr)} mm</dd>
+        <dt>Zero Z on the base's original top</dt><dd>and keep it</dd>
+      </dl>
+      <div class="field" style="margin-top:10px"><label for="f-cureHours">Glue cure time</label><span><input id="f-cureHours" type="number" min="0.5" max="168" step="0.5" value="${s.cureHours}" data-set="cureHours" /><span class="unit">h</span></span></div>
+      ${d.warnings.length ? `<ul class="warns">${d.warnings.map((w) => `<li>${esc(w)}</li>`).join("")}</ul>` : ""}
+    </div>
+    <div class="sec rounds-list">${cards}</div>
+    <div class="sec"><p class="muted" style="font-size:12.5px;margin:0">Changing the image, woods or settings after you start cutting changes this plan. Export the project as a backup before you begin. Files are SVG in millimetres; native G-code comes in the next milestone.</p></div>`;
+}
+
+function svgFile(wMm: number, hMm: number, comment: string, loops: Float32Array[]): Blob {
+  const W = fmt(wMm, 3), H = fmt(hMm, 3);
+  const d = loops.map((l) => loopToSvg(l)).join("");
+  return new Blob([`<?xml version="1.0" encoding="UTF-8"?>
+<!-- ${comment.replace(/--/g, "-")} -->
+<svg xmlns="http://www.w3.org/2000/svg" width="${W}mm" height="${H}mm" viewBox="0 0 ${W} ${H}">
+  <path fill="#000" fill-rule="evenodd" d="${d}"/>
+</svg>
+`], { type: "image/svg+xml" });
+}
+
+function downloadRoundFile(spec: string) {
+  const plan = roundPlan();
+  if (!plan || !work) return;
+  const [kind, ri, wj] = spec.split(":");
+  const i = Number(ri), r = plan.shapes[i];
+  const s = P.settings, woods = allWoods(), base = fileName(P).replace(".kundekar.json", "");
+  const slug = (t: string) => t.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  if (kind === "pocket") {
+    download(svgFile(work.wMm, work.hMm,
+      `Kundekar: ${P.name}. Round ${i + 1} POCKET, cut into the base board (${P.base.name}). V-bit ${s.vAngle} deg, pocket depth ${fmt(s.pocketDepth)} mm from the current top. Units mm; the page is the whole base board (${fmt(work.wMm)} x ${fmt(work.hMm)} mm), origin at its top-left corner.`,
+      r.pocket), `${base}-R${i + 1}-pocket.svg`);
+  } else {
+    const p = r.plugs.find((q) => q.wood === Number(wj));
+    if (!p) return;
+    const w = woods[p.wood];
+    download(svgFile(p.w, p.h,
+      `Kundekar: ${P.name}. Round ${i + 1} PLUG from ${w.name}, already MIRRORED. V-bit ${s.vAngle} deg, plug depth ${fmt(s.pocketDepth + s.glueGap)} mm. Units mm; page = minimum plug board size with a margin.`,
+      p.loops), `${base}-R${i + 1}-plug-${slug(w.name)}.svg`);
+  }
 }
 
 // ---------------------------------------------------------------- live readouts
@@ -984,7 +1128,12 @@ function drawVector() {
   ctx.fillStyle = fill(0);
   ctx.fillRect(0, 0, work.wMm, work.hMm);
   const px = 1 / s; // one screen pixel, in mm
+  // Rounds step: show the board as it is after the selected round.
+  const rounds = P.step === "rounds" ? roundPlan() : null;
+  const hidden = new Set<number>();
+  if (rounds) rounds.shapes.forEach((r, i) => { if (i > selRound) r.woods.forEach((j) => hidden.add(j)); });
   result.outlines.forEach((o, n) => {
+    if (hidden.has(o.wood)) return;
     const path = result!.paths[n], f = fill(o.wood);
     // A thin stroke in the wood's own color closes anti-aliasing seams between neighbours.
     ctx.strokeStyle = f; ctx.lineWidth = 0.8 * px; ctx.stroke(path);
@@ -993,7 +1142,18 @@ function drawVector() {
   if (textured) {
     ctx.strokeStyle = "rgba(30, 20, 12, 0.55)";
     ctx.lineWidth = Math.max(0.9 * px, 0.08); // glue line
-    for (const p of result.paths) ctx.stroke(p);
+    result.paths.forEach((p, n) => { if (!hidden.has(result!.outlines[n].wood)) ctx.stroke(p); });
+  }
+  if (rounds && rounds.pocketPaths[selRound]) {
+    ctx.save();
+    ctx.setLineDash([7 * px, 4 * px]);
+    ctx.lineWidth = 2.5 * px;
+    ctx.strokeStyle = "#ffffff";
+    ctx.stroke(rounds.pocketPaths[selRound]);
+    ctx.lineDashOffset = 7 * px;
+    ctx.strokeStyle = "#1c6b66";
+    ctx.stroke(rounds.pocketPaths[selRound]);
+    ctx.restore();
   }
 }
 
@@ -1369,6 +1529,10 @@ function bindPanel() {
 
   panel.onclick = (e) => {
     const t = e.target as HTMLElement;
+    const rd = t.closest<HTMLElement>("[data-round]")?.dataset.round;
+    if (rd !== undefined) { selRound = Number(rd); renderPanel(); drawVector(); return; }
+    const dl = t.closest<HTMLElement>("[data-dl]")?.dataset.dl;
+    if (dl) { downloadRoundFile(dl); return; }
     const mt = t.closest<HTMLElement>("[data-masktool]")?.dataset.masktool as "keep" | "cut" | undefined;
     if (mt) { maskTool = maskTool === mt ? null : mt; view = "original"; renderPanel(); renderStage(); return; }
     const tl = t.closest<HTMLElement>("[data-tool]")?.dataset.tool as Tool | undefined;
@@ -1478,6 +1642,23 @@ function bindPanel() {
 
   panel.onchange = (e) => {
     const t = e.target as HTMLInputElement;
+    if (t.dataset.task) {
+      const key = t.dataset.task;
+      if (t.checked) { P.done[key] = Date.now(); P.log.push({ t: Date.now(), text: `Done: ${key}` }); }
+      else delete P.done[key];
+      touch(false);
+      const plan = roundPlan();
+      if (plan && t.checked) {
+        const i = Number(key.slice(1, key.indexOf(":")));
+        if (roundTasks(i, plan.shapes[i]).every((k) => P.done[k])) {
+          toast(i + 1 < plan.shapes.length ? `Round ${i + 1} complete. On to round ${i + 2}.` : "Last round complete: the inlay is finished!");
+          selRound = firstOpenRound(plan.shapes);
+          drawVector();
+        }
+      }
+      renderPanel();
+      return;
+    }
     if (t.dataset.act === "maskOn") {
       P.maskOn = t.checked;
       sizeChanged(false);
@@ -1596,7 +1777,7 @@ function sizeChanged(rerender: boolean) {
 function setSetting(key: NumericSetting, v: number) {
   const limits: Record<NumericSetting, [number, number]> = {
     widthMm: [20, 2000], heightMm: [20, 2000], marginMm: [0, 200], imgX: [-5000, 5000], imgY: [-5000, 5000], imgWidthMm: [5, 5000], vAngle: [10, 150], pocketDepth: [0.2, 10], glueGap: [0, 3],
-    surfacePerRound: [0, 2], minRetained: [0.05, 5], minLineMm: [0, 10], minAreaMm2: [0, 100], colorWeight: [0, 1], smoothing: [0, 1],
+    surfacePerRound: [0, 2], minRetained: [0.05, 5], minLineMm: [0, 10], minAreaMm2: [0, 100], colorWeight: [0, 1], smoothing: [0, 1], cureHours: [0.5, 168],
   };
   const [lo, hi] = limits[key];
   P.settings[key] = clamp(v, lo, hi);

@@ -132,9 +132,12 @@ Implemented in `src/core/simplify.ts` (steps 1–3 and a colour-level version of
    simplification → minimum-feature cleanup → real-scale preview. Step-by-step UI with
    Back/Next. Projects are autosaved in IndexedDB and can be exported/imported as files,
    because one project spans days of glue curing.
-3. **MVP 2:** round planning (adjacency and ordering) and an SVG/DXF export of the
-   pocket and plug for each round. Cut these in existing CAM first to validate the
-   process.
+3. **MVP 2:** done (2026-11-24). Round planning at wood level (greedy colouring of the
+   adjacency graph, largest area first), per-round pocket SVG on the base and mirrored
+   plug SVG per wood, a checklist with Z depths and a glue-cure timer. Holes holding
+   only later-round woods are filled in the pocket/plug. Cut these in existing CAM first
+   to validate the process. Not yet: nesting several islands onto smaller plug boards,
+   DXF, region-level (rather than wood-level) round planning.
 4. **MVP 3:** native G-code generation: clearing, V-carve, plug, surfacing,
    registration holes. Generic post-processor.
 5. Downloadable/offline version reusing the same core.

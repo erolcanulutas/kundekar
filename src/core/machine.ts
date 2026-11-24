@@ -23,6 +23,7 @@ export interface MachineSettings {
   minAreaMm2: number; // islands smaller than this are filled by the surrounding wood
   colorWeight: number; // 0 = "Light & dark" (lightness only), 1 = "Color" (full perceptual distance)
   smoothing: number; // 0 = raw pixel edges, 1 = strongly rounded region borders
+  cureHours: number; // glue cure time before surfacing
 }
 
 export type NumericSetting = { [K in keyof MachineSettings]: MachineSettings[K] extends number ? K : never }[keyof MachineSettings];
@@ -45,6 +46,7 @@ export const DEFAULT_SETTINGS: MachineSettings = {
   minAreaMm2: 4,
   colorWeight: 0,
   smoothing: 0.7,
+  cureHours: 24,
 };
 
 export const SIZE_PRESETS: { label: string; widthMm: number; heightMm: number }[] = [

@@ -3,7 +3,7 @@ import { hexToLab } from "./core/color";
 import type { PxEdit } from "./core/edits";
 import { renderFlat, renderInlay, type RenderWood } from "./core/render";
 import { finish, prepare, type Prepared, type SimplifyInput, type SimplifyResult } from "./core/simplify";
-import { vectorize, type WoodOutline } from "./core/vectorize";
+import { blurPassesFor, vectorize, type WoodOutline } from "./core/vectorize";
 
 export interface JobRequest {
   id: number;
@@ -60,10 +60,7 @@ self.onmessage = (e: MessageEvent<JobRequest>) => {
     const result = finish(cache.prep, inp, q.edits);
     const flat = renderFlat(result.labels, q.width, q.height, q.woods);
     const inlay = renderInlay(result.labels, q.width, q.height, q.pxPerMm, q.woods);
-    // Smoother outlines with more smoothing, but sigma stays under a quarter of the thinnest line.
-    const linePx = q.minFeatureMm * q.pxPerMm;
-    const maxPasses = Math.max(1, Math.floor(2 * (linePx / 4) ** 2));
-    const passes = Math.min(maxPasses, Math.max(1, Math.round(1 + q.smoothing * 8)));
+    const passes = blurPassesFor(q.minFeatureMm, q.pxPerMm, q.smoothing);
     const outlines = vectorize(result.labels, q.width, q.height, q.woods.length, q.pxPerMm, true, passes);
     const transfer = [flat.buffer, inlay.buffer, result.labels.buffer] as ArrayBuffer[];
     for (const o of outlines) for (const l of o.loops) transfer.push(l.buffer as ArrayBuffer);

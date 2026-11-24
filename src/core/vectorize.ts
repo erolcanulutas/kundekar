@@ -11,6 +11,13 @@ export interface WoodOutline {
   loops: Float32Array[]; // each loop: x0,y0,x1,y1,... in mm, closed implicitly
 }
 
+/** Blur passes for outlines: more with more smoothing, sigma under a quarter of the thinnest line. */
+export function blurPassesFor(minFeatureMm: number, pxPerMm: number, smoothing: number): number {
+  const linePx = minFeatureMm * pxPerMm;
+  const maxPasses = Math.max(1, Math.floor(2 * (linePx / 4) ** 2));
+  return Math.min(maxPasses, Math.max(1, Math.round(1 + smoothing * 8)));
+}
+
 /**
  * blurPasses: how many 3x3 tent blurs smooth each mask before tracing
  * (n passes ~ a Gaussian of sigma sqrt(n/2) px). More passes = smoother curves;
