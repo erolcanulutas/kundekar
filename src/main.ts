@@ -588,7 +588,6 @@ function renderSimplify(): string {
       <div class="field range"><label for="r-area">Smallest area</label><output class="mono" data-live="areaOut"></output>
         <input id="r-area" type="range" min="0" max="100" step="0.5" value="${s.minAreaMm2}" data-set="minAreaMm2" />
         <span class="hint">Dots and islands smaller than this are filled by the wood around them.</span></div>
-        <span class="hint">× the narrowest feature your bit can hold. Higher = bolder shapes, fewer tiny islands.</span></div>
       <div class="field range"><label for="r-color">Match by</label><output class="mono" data-live="colorOut"></output>
         <input id="r-color" type="range" min="0" max="1.5" step="0.05" value="${s.colorWeight}" data-set="colorWeight" />
         <span class="hint">Left: light/dark only, like an engraving. Right: hue matters more.</span></div>
