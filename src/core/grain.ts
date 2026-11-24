@@ -62,6 +62,30 @@ export function seedFor(uid: string): number {
   return (h >>> 0) % 100000;
 }
 
+/**
+ * Paint a grain tile that repeats without seams: each point blends the grain at
+ * (x,y) with its copies one period away, weighted so opposite edges match.
+ */
+export function paintSeamlessTile(canvas: HTMLCanvasElement, hex: string, figure: number, seed: number, mmPerPx: number): void {
+  const n = canvas.width;
+  const T = n * mmPerPx;
+  const ctx = canvas.getContext("2d")!;
+  const img = ctx.createImageData(n, n);
+  const lut = grainLut(hex);
+  for (let y = 0; y < n; y++) {
+    const v = y / n, ym = y * mmPerPx;
+    for (let x = 0; x < n; x++) {
+      const u = x / n, xm = x * mmPerPx;
+      const g =
+        (1 - u) * (1 - v) * grain(xm, ym, seed, figure) + u * (1 - v) * grain(xm - T, ym, seed, figure) +
+        (1 - u) * v * grain(xm, ym - T, seed, figure) + u * v * grain(xm - T, ym - T, seed, figure);
+      const k = lutIndex(g), o = (y * n + x) * 4;
+      img.data[o] = lut[k]; img.data[o + 1] = lut[k + 1]; img.data[o + 2] = lut[k + 2]; img.data[o + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
 /** Paint a grain swatch into a canvas (used for wood cards). */
 export function paintSwatch(canvas: HTMLCanvasElement, hex: string, figure: number, seed: number, mmPerPx = 0.25): void {
   const w = canvas.width, h = canvas.height;

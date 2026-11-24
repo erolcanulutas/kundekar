@@ -237,7 +237,9 @@ table.stats th.n { text-align: right; }
 .stage-grid .corner { position: sticky; top: 0; left: 0; z-index: 3; background: var(--stage); font: 9px var(--mono); color: #8d7d66; display: grid; place-items: center; }
 .stage-grid .rx { position: sticky; top: 0; z-index: 2; background: var(--stage); }
 .stage-grid .ry { position: sticky; left: 0; z-index: 2; background: var(--stage); }
-.stage-grid canvas.view { image-rendering: auto; box-shadow: 0 14px 40px rgba(0, 0, 0, 0.55); background: #3a3128; }
+.stage-grid .viewbox { position: relative; box-shadow: 0 14px 40px rgba(0, 0, 0, 0.55); background: #3a3128; }
+.stage-grid canvas.view { display: block; width: 100%; height: 100%; }
+.stage-grid canvas.vec { position: absolute; display: none; pointer-events: none; }
 .stage-empty { display: grid; place-items: center; height: 100%; text-align: center; padding: 40px; color: #b5a68e; }
 .stage-empty svg { width: 120px; opacity: 0.5; margin-bottom: 14px; }
 .stage-empty h3 { font-size: 22px; color: #e9dfcd; margin-bottom: 6px; }

@@ -52,11 +52,16 @@ export function simplify(inp: SimplifyInput): SimplifyResult {
   }
 
   // Lightness stretch: map image 1st..99th percentile onto the wood range.
-  const [lo, hi] = percentiles(L, 0.01, 0.99);
+  // Statistics over the artwork only: transparent pixels (the board border, or
+  // around a "fit" image) are not part of the picture.
+  const [lo, hi] = percentiles(L, transparent, 0.01, 0.99);
   let wLo = Infinity, wHi = -Infinity;
   for (const lab of woodLabs) { wLo = Math.min(wLo, lab[0]); wHi = Math.max(wHi, lab[0]); }
   const scale = hi - lo > 1 ? (wHi - wLo) / (hi - lo) : 1;
   for (let i = 0; i < n; i++) L[i] = wLo + (L[i] - lo) * scale;
+  // Transparent areas become base wood; give them its color before blurring so
+  // they don't bleed black into the image edges.
+  for (let i = 0; i < n; i++) if (transparent[i]) { L[i] = woodLabs[0][0]; A[i] = woodLabs[0][1]; B[i] = woodLabs[0][2]; }
 
   const blurR = Math.max(0, Math.round(radiusPx * 0.35));
   if (blurR > 0) for (const ch of [L, A, B]) boxBlur3(ch, w, h, blurR);
@@ -104,11 +109,13 @@ export function simplify(inp: SimplifyInput): SimplifyResult {
   };
 }
 
-function percentiles(v: Float32Array, a: number, b: number): [number, number] {
+function percentiles(v: Float32Array, skip: Uint8Array, a: number, b: number): [number, number] {
   const hist = new Uint32Array(1001);
-  for (let i = 0; i < v.length; i++) hist[Math.max(0, Math.min(1000, Math.round(v[i] * 10)))]++;
+  let count = 0;
+  for (let i = 0; i < v.length; i++) if (!skip[i]) { hist[Math.max(0, Math.min(1000, Math.round(v[i] * 10)))]++; count++; }
+  if (!count) return [0, 100];
   const find = (q: number) => {
-    const target = q * v.length;
+    const target = q * count;
     let acc = 0;
     for (let i = 0; i <= 1000; i++) { acc += hist[i]; if (acc >= target) return i / 10; }
     return 100;

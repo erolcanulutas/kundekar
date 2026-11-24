@@ -1,6 +1,9 @@
 import "./style.css";
-import { DEFAULT_SETTINGS, derive, fmt, pxPerMm, SIZE_PRESETS, V_ANGLES, type Derived } from "./core/machine";
-import { paintSwatch, seedFor } from "./core/grain";
+import {
+  boardLayout, DEFAULT_SETTINGS, derive, fmt, pxPerMm, SIZE_PRESETS, V_ANGLES, type Derived, type FitMode, type NumericSetting, type SizeMode,
+} from "./core/machine";
+import { loopToPath2D, loopToSvg, type WoodOutline } from "./core/vectorize";
+import { paintSeamlessTile, paintSwatch, seedFor } from "./core/grain";
 import { planRounds, type SimplifyResult } from "./core/simplify";
 import {
   MAX_TONES, presetById, TONE_THICKNESS, WOOD_KITS, WOOD_PRESETS, woodFromPreset, woodsFromKit, type Wood,
@@ -16,8 +19,8 @@ import type { JobRequest, JobResponse } from "./worker";
 type View = "original" | "woods" | "inlay";
 type Zoom = "fit" | "real" | "custom";
 
-interface Work { w: number; h: number; ppm: number; wMm: number; hMm: number; rgba: ImageData }
-interface Result { res: SimplifyResult; flat: ImageData; inlay: ImageData; ms: number }
+interface Work { w: number; h: number; ppm: number; wMm: number; hMm: number; rgba: ImageData; sourcePx: number; imgPerMm: number }
+interface Result { res: SimplifyResult; flat: ImageData; inlay: ImageData; outlines: WoodOutline[]; paths: Path2D[]; ms: number }
 
 let P: Project;
 let bitmap: ImageBitmap | null = null;
@@ -103,11 +106,11 @@ interface Step {
 }
 
 const STEPS: Step[] = [
-  { id: "stock", title: "Wood stock", sub: "Base + tone boards", phase: "Setup", view: "inlay", blocker: () => null, render: renderStock },
   {
-    id: "image", title: "Image & size", sub: "Artwork, finished size", phase: "Setup", view: "original",
+    id: "image", title: "Image & size", sub: "Artwork, board size", phase: "Setup", view: "original",
     blocker: () => (P.image ? null : "Add an image to continue."), render: renderImage,
   },
+  { id: "stock", title: "Wood stock", sub: "Base + tone boards", phase: "Setup", view: "inlay", blocker: () => null, render: renderStock },
   { id: "machine", title: "Bit & depths", sub: "V-bit, pocket, surfacing", phase: "Setup", view: "inlay", blocker: () => null, render: renderMachine },
   {
     id: "simplify", title: "Simplify", sub: "Wood regions", phase: "Setup", view: "inlay",
@@ -206,15 +209,24 @@ async function prepareImage() {
 
 function prepareWork() {
   if (!bitmap) { work = null; return; }
-  const wMm = P.settings.widthMm;
-  const hMm = (wMm * bitmap.height) / bitmap.width;
-  const ppm = pxPerMm(wMm, hMm);
-  const w = Math.max(8, Math.round(wMm * ppm)), h = Math.max(8, Math.round(hMm * ppm));
+  const g = boardLayout(P.settings, bitmap.width, bitmap.height);
+  if (P.settings.sizeMode === "image") P.settings.heightMm = Math.round(g.hMm * 10) / 10;
+  const ppm = pxPerMm(g.wMm, g.hMm);
+  const w = Math.max(8, Math.round(g.wMm * ppm)), h = Math.max(8, Math.round(g.hMm * ppm));
+  const sx = w / g.wMm, sy = h / g.hMm;
   const c = new OffscreenCanvas(w, h);
   const ctx = c.getContext("2d")!;
   ctx.imageSmoothingQuality = "high";
-  ctx.drawImage(bitmap, 0, 0, w, h);
-  work = { w, h, ppm: w / wMm, wMm, hMm, rgba: ctx.getImageData(0, 0, w, h) };
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(g.art.x * sx, g.art.y * sy, g.art.w * sx, g.art.h * sy);
+  ctx.clip(); // "fill" crops to the artwork area; the border stays transparent = base wood
+  ctx.drawImage(bitmap, g.draw.x * sx, g.draw.y * sy, g.draw.w * sx, g.draw.h * sy);
+  ctx.restore();
+  work = {
+    w, h, ppm: sx, wMm: g.wMm, hMm: g.hMm, rgba: ctx.getImageData(0, 0, w, h),
+    sourcePx: Math.max(1, (g.draw.w * sx) / bitmap.width), imgPerMm: bitmap.width / g.draw.w,
+  };
 }
 
 let processTimer: number | undefined;
@@ -239,7 +251,7 @@ function runJob() {
     minFeatureMm: d.minFeature,
     colorWeight: P.settings.colorWeight,
     smoothing: P.settings.smoothing,
-    sourcePx: bitmap ? Math.max(1, work.w / bitmap.width) : 1,
+    sourcePx: work.sourcePx,
   };
   worker.postMessage(req, [req.rgba.buffer]);
   updateStatus();
@@ -250,10 +262,12 @@ worker.onmessage = (e: MessageEvent<JobResponse>) => {
   busy = false;
   if (r.error) {
     toast("Processing failed: " + r.error);
-  } else if (r.id === jobId && work && r.result && r.flat && r.inlay) {
+  } else if (r.id === jobId && work && r.result && r.flat && r.inlay && r.outlines && r.flat.length === work.w * work.h * 4) {
     const firstResult = !result;
     result = {
       res: r.result,
+      outlines: r.outlines,
+      paths: r.outlines.map((o) => { const p = new Path2D(); for (const l of o.loops) loopToPath2D(p, l); return p; }),
       flat: new ImageData(r.flat as Uint8ClampedArray<ArrayBuffer>, work.w, work.h),
       inlay: new ImageData(r.inlay as Uint8ClampedArray<ArrayBuffer>, work.w, work.h),
       ms: r.ms ?? 0,
@@ -381,7 +395,7 @@ function renderStock(): string {
     const bars = [k.base, ...k.tones].map((id) => `<i style="background:${presetById(id)!.color}"></i>`).join("");
     return `<button class="kit" data-kit="${k.id}" title="${esc(k.description)}"><span class="bars">${bars}</span><b>${k.name}</b></button>`;
   }).join("");
-  return `${head(1, "Wood stock", "Choose the boards you really have. The base is the ~10 mm board everything is inlaid into; tone woods are the thinner boards the plugs are cut from. Set each color to match your actual board.")}
+  return `${head(2, "Wood stock", "Choose the boards you really have. The base is the ~10 mm board everything is inlaid into; tone woods are the thinner boards the plugs are cut from. Set each color to match your actual board.")}
     <div class="sec"><h3>Start from a kit <span>replaces the list</span></h3><div class="kits">${kits}</div></div>
     <div class="sec"><h3>Your boards <span>${1 + P.tones.length} colors</span></h3>
       <div class="tag-label"><span>Base board</span></div>
@@ -402,17 +416,34 @@ function renderImage(): string {
          <button class="btn small ghost danger" data-act="clearImage">Remove</button></p></div></div>`
     : `<div class="drop" data-act="pick" tabindex="0" role="button"><b>Drop an image here</b>
          <span class="muted">or click to choose · or paste with Ctrl+V<br/>PNG, JPG, WebP · transparent areas become base wood</span></div>`;
-  const chips = SIZE_PRESETS.map((p) => `<button class="chip" data-width="${p.widthMm}" aria-pressed="${p.widthMm === s.widthMm}">${p.label} · ${p.widthMm}</button>`).join("");
-  return `${head(2, "Image & size", "Detailed artwork is welcome: it will be reduced to your woods in step 4. The piece keeps the image's proportions.")}
+  const board = s.sizeMode === "board";
+  const chips = SIZE_PRESETS.map((p, i) => `<button class="chip" data-preset="${i}">${p.label} · ${board ? `${p.widthMm}×${p.heightMm}` : p.widthMm}</button>`).join("");
+  const modes: [SizeMode, string][] = [["image", "Follow the image"], ["board", "Enter board size"]];
+  const fits: [FitMode, string, string][] = [
+    ["contain", "Fit", "Whole image visible; leftover space becomes base wood."],
+    ["cover", "Fill", "Image fills the board; the overflow is cropped."],
+    ["stretch", "Stretch", "Image is distorted to the board's proportions."],
+  ];
+  return `${head(1, "Image & size", "Detailed artwork is welcome: it will be reduced to your woods in step 4. Size the base board to match the image, or enter your board and place the image on it.")}
     <div class="sec"><h3>Artwork</h3>${img}<input type="file" id="imageFile" accept="image/*" hidden /></div>
-    <div class="sec"><h3>Finished size</h3>
+    <div class="sec"><h3>Base board size</h3>
+      <div class="field"><span class="seg" role="group" aria-label="Size mode">${modes.map(([m, l]) => `<button data-sizemode="${m}" aria-pressed="${s.sizeMode === m}">${l}</button>`).join("")}</span></div>
       <div class="chips" style="margin-bottom:12px">${chips}</div>
-      <div class="field"><label for="widthMm">Width</label><span><input id="widthMm" type="number" min="20" max="2000" step="1" value="${s.widthMm}" data-set="widthMm" /><span class="unit">mm</span></span></div>
-      <dl class="readout" data-live="size"></dl>
-    </div>`;
+      <div class="field"><label for="f-widthMm">Width</label><span><input id="f-widthMm" type="number" min="20" max="2000" step="1" value="${s.widthMm}" data-set="widthMm" /><span class="unit">mm</span></span></div>
+      <div class="field"><label for="f-heightMm">Height</label><span>${board
+        ? `<input id="f-heightMm" type="number" min="20" max="2000" step="1" value="${s.heightMm}" data-set="heightMm" /><span class="unit">mm</span>`
+        : `<output class="mono" data-live="hOut"></output>`}</span>
+        <span class="hint">${board ? `<button class="btn small ghost" data-act="swapWH">⇄ Swap width and height</button>` : "Follows the image's proportions."}</span></div>
+      <div class="field"><label for="f-marginMm">Border</label><span><input id="f-marginMm" type="number" min="0" max="200" step="1" value="${s.marginMm}" data-set="marginMm" /><span class="unit">mm</span></span>
+        <span class="hint">Plain base wood around the artwork, e.g. room for registration pins.</span></div>
+    </div>
+    ${board ? `<div class="sec"><h3>Image on the board</h3>
+      <div class="field"><span class="seg" role="group" aria-label="Image placement">${fits.map(([f, l]) => `<button data-fit="${f}" aria-pressed="${s.fit === f}">${l}</button>`).join("")}</span>
+      <span class="hint">${fits.find((f) => f[0] === s.fit)![2]}</span></div></div>` : ""}
+    <div class="sec"><h3>Result</h3><dl class="readout" data-live="size"></dl></div>`;
 }
 
-function numField(key: keyof Project["settings"], label: string, hint: string, min: number, max: number, step: number) {
+function numField(key: NumericSetting, label: string, hint: string, min: number, max: number, step: number) {
   return `<div class="field"><label for="f-${key}">${label}</label>
     <span><input id="f-${key}" type="number" min="${min}" max="${max}" step="${step}" value="${P.settings[key]}" data-set="${key}" /><span class="unit">mm</span></span>
     <span class="hint">${hint}</span></div>`;
@@ -476,12 +507,16 @@ function refreshLive() {
   set("section", sectionSvg(d));
 
   if (work) {
-    set("size", `<dt>Height (from image)</dt><dd>${fmt(work.hMm, 1)} mm</dd>
+    set("hOut", `${fmt(work.hMm, 1)} mm`);
+    set("size", `<dt>Board</dt><dd>${fmt(work.wMm, 1)} × ${fmt(work.hMm, 1)} mm</dd>
+      <dt>Image detail</dt><dd>${fmt(work.imgPerMm, 1)} px/mm</dd>
+      ${work.imgPerMm < 1.5 ? `<dt class="muted" style="grid-column:1/-1;font-size:12px">Low resolution for this size: edges will be smoothed. A larger image gives finer detail.</dt>` : ""}
       <dt>Working resolution</dt><dd>${work.w} × ${work.h} px</dd>
       <dt>Pixel size</dt><dd>${fmt(1 / work.ppm, 2)} mm</dd>
       <dt>Smallest region at this size</dt><dd>${fmt(d.minFeature, 1)} mm</dd>`);
   } else {
-    set("size", `<dt class="muted">Height follows the image once one is added.</dt><dd></dd>`);
+    set("hOut", "after an image is added");
+    set("size", `<dt class="muted">Add an image to see the board layout.</dt><dd></dd>`);
   }
 
   set("simplifyOut", `× ${fmt(P.settings.simplify, 1)} → ${fmt(d.minFeature, 1)} mm`);
@@ -490,7 +525,7 @@ function refreshLive() {
 
   const woods = allWoods();
   if (!work) {
-    set("stats", `<p class="muted">Add an image in step 2 to see how much of each wood you need.</p>`);
+    set("stats", `<p class="muted">Add an image in step 1 to see how much of each wood you need.</p>`);
     set("rounds", "");
   } else if (!result) {
     set("stats", `<p class="muted busy">Reducing the image to your woods</p>`);
@@ -562,7 +597,8 @@ function renderStageShell() {
       <span class="seg" role="group" aria-label="Zoom"><button data-zoom="fit" aria-pressed="${zoom === "fit"}">Fit</button><button data-zoom="real" aria-pressed="${zoom === "real"}" title="Shown at real physical size">1 : 1 real size</button></span>
       <span class="spacer"></span>
       <button class="btn small" data-act="calibrate" title="Make 1:1 match your screen">Calibrate screen</button>
-      <button class="btn small" data-act="png" ${work ? "" : "disabled"}>Save PNG</button>
+      <button class="btn small" data-act="png" ${work ? "" : "disabled"} title="Raster image at working resolution">Save PNG</button>
+      <button class="btn small" data-act="svg" ${result ? "" : "disabled"} title="Vector outlines of every wood, in millimetres">Save SVG</button>
     </div>
     <div class="stage-scroll"></div>
     <div class="stage-foot"></div>`;
@@ -576,14 +612,17 @@ function renderStage() {
   $$<HTMLButtonElement>("[data-view]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.view === view)));
   const png = $<HTMLButtonElement>('[data-act="png"]');
   if (png) png.disabled = !work;
+  const svg = $<HTMLButtonElement>('[data-act="svg"]');
+  if (svg) svg.disabled = !result;
   if (!work) {
     scroll.innerHTML = `<div class="stage-empty"><div>${STAR.replace("<svg", '<svg style="color:#e9dfcd"')}
-      <h3>No image yet</h3><p>Add artwork in step 2 (Image & size), or drop an image anywhere on this page.</p></div></div>`;
+      <h3>No image yet</h3><p>Add artwork in step 1 (Image & size), or drop an image anywhere on this page.</p></div></div>`;
     updateStatus();
     return;
   }
   if (!$("canvas.view", scroll)) {
-    scroll.innerHTML = `<div class="stage-grid"><div class="corner">mm</div><canvas class="rx"></canvas><canvas class="ry"></canvas><canvas class="view"></canvas></div>`;
+    scroll.innerHTML = `<div class="stage-grid"><div class="corner">mm</div><canvas class="rx"></canvas><canvas class="ry"></canvas>
+      <div class="viewbox"><canvas class="view"></canvas><canvas class="vec" aria-hidden="true"></canvas></div></div>`;
   }
   const cv = $<HTMLCanvasElement>("canvas.view", scroll)!;
   cv.width = work.w; cv.height = work.h;
@@ -604,10 +643,89 @@ function layoutStage() {
   grid.style.gridTemplateColumns = `${R}px ${W}px`;
   grid.style.gridTemplateRows = `${R}px ${H}px`;
   grid.style.marginTop = `${Math.max(0, (scroll.clientHeight - H - R - 24) / 2)}px`;
-  const cv = $<HTMLCanvasElement>("canvas.view", grid)!;
-  cv.style.width = W + "px"; cv.style.height = H + "px";
+  const vb = $<HTMLElement>(".viewbox", grid)!;
+  vb.style.width = W + "px"; vb.style.height = H + "px";
   drawRuler($<HTMLCanvasElement>("canvas.rx", grid)!, W, R, scale, true);
   drawRuler($<HTMLCanvasElement>("canvas.ry", grid)!, H, R, scale, false);
+  drawVector();
+}
+
+// ---- Vector preview: only the visible part is drawn, at screen resolution,
+// so borders stay sharp at any zoom.
+
+const tileCache = new Map<string, HTMLCanvasElement>();
+const TILE_MM_PER_PX = 0.2;
+function grainTile(w: Wood): HTMLCanvasElement {
+  const key = `${w.color}|${w.figure}|${w.uid}`;
+  let c = tileCache.get(key);
+  if (!c) {
+    c = document.createElement("canvas");
+    c.width = c.height = 640; // 128 mm repeat
+    paintSeamlessTile(c, w.color, w.figure, seedFor(w.uid), TILE_MM_PER_PX);
+    tileCache.set(key, c);
+  }
+  return c;
+}
+
+let vecFrame = 0;
+function requestVector() {
+  if (!vecFrame) vecFrame = requestAnimationFrame(() => { vecFrame = 0; drawVector(); });
+}
+
+function drawVector() {
+  const scroll = $(".stage-scroll"), vb = $(".viewbox"), vec = $<HTMLCanvasElement>("canvas.vec");
+  if (!scroll || !vb || !vec || !work) return;
+  if (!result || view === "original") { vec.style.display = "none"; return; }
+  const sr = scroll.getBoundingClientRect(), br = vb.getBoundingClientRect();
+  const x0 = Math.max(sr.left, br.left), y0 = Math.max(sr.top, br.top);
+  const x1 = Math.min(sr.right, br.right), y1 = Math.min(sr.bottom, br.bottom);
+  if (x1 <= x0 || y1 <= y0) { vec.style.display = "none"; return; }
+  const dpr = window.devicePixelRatio || 1, s = currentScale();
+  const cw = x1 - x0, ch = y1 - y0;
+  Object.assign(vec.style, { display: "block", left: `${x0 - br.left}px`, top: `${y0 - br.top}px`, width: `${cw}px`, height: `${ch}px` });
+  vec.width = Math.round(cw * dpr); vec.height = Math.round(ch * dpr);
+  const ctx = vec.getContext("2d")!;
+  ctx.setTransform(dpr * s, 0, 0, dpr * s, -(x0 - br.left) * dpr, -(y0 - br.top) * dpr); // mm -> device px
+  const woods = allWoods();
+  const textured = view === "inlay";
+  const fill = (i: number) => {
+    if (!textured) return woods[i].color;
+    const pat = ctx.createPattern(grainTile(woods[i]), "repeat")!;
+    pat.setTransform(new DOMMatrix().scale(TILE_MM_PER_PX));
+    return pat;
+  };
+  ctx.fillStyle = fill(0);
+  ctx.fillRect(0, 0, work.wMm, work.hMm);
+  const px = 1 / s; // one screen pixel, in mm
+  result.outlines.forEach((o, n) => {
+    const path = result!.paths[n], f = fill(o.wood);
+    // A thin stroke in the wood's own color closes anti-aliasing seams between neighbours.
+    ctx.strokeStyle = f; ctx.lineWidth = 0.8 * px; ctx.stroke(path);
+    ctx.fillStyle = f; ctx.fill(path, "evenodd");
+  });
+  if (textured) {
+    ctx.strokeStyle = "rgba(30, 20, 12, 0.55)";
+    ctx.lineWidth = Math.max(0.9 * px, 0.08); // glue line
+    for (const p of result.paths) ctx.stroke(p);
+  }
+}
+
+function exportSvg() {
+  if (!result || !work) return;
+  const woods = allWoods();
+  const W = fmt(work.wMm, 3), H = fmt(work.hMm, 3);
+  const groups = result.outlines.map((o) => {
+    const d = o.loops.map((l) => loopToSvg(l)).join("");
+    return `  <path id="wood-${o.wood}" fill="${woods[o.wood].color}" fill-rule="evenodd" d="${d}"><title>${esc(woods[o.wood].name)}</title></path>`;
+  }).join("\n");
+  const svg = `<?xml version="1.0" encoding="UTF-8"?>
+<!-- Kundekar: ${esc(P.name)}. Units are millimetres. Base wood: ${esc(woods[0].name)}. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="${W}mm" height="${H}mm" viewBox="0 0 ${W} ${H}">
+  <rect id="wood-0" width="${W}" height="${H}" fill="${woods[0].color}"><title>${esc(woods[0].name)} (base)</title></rect>
+${groups}
+</svg>
+`;
+  download(new Blob([svg], { type: "image/svg+xml" }), fileName(P).replace(".kundekar.json", "-woods.svg"));
 }
 
 function fitScale(): number {
@@ -679,6 +797,7 @@ function bindStageScroll() {
   scroll.addEventListener("pointerup", end);
   scroll.addEventListener("pointercancel", end);
   scroll.addEventListener("dblclick", () => work && setZoom("fit"));
+  scroll.addEventListener("scroll", requestVector, { passive: true });
 }
 
 function drawRuler(c: HTMLCanvasElement, len: number, thick: number, scale: number, horiz: boolean) {
@@ -848,6 +967,7 @@ function bindShell() {
     if (z) setZoom(z);
     const act = t.closest<HTMLElement>("[data-act]")?.dataset.act;
     if (act === "calibrate") openCalibrate();
+    if (act === "svg") exportSvg();
     if (act === "png") {
       $<HTMLCanvasElement>("canvas.view")?.toBlob((b) => b && download(b, fileName(P).replace(".kundekar.json", `-${view}.png`)));
     }
@@ -882,14 +1002,29 @@ function bindPanel() {
       });
       return;
     }
-    const width = t.closest<HTMLElement>("[data-width]")?.dataset.width;
-    if (width) { setSetting("widthMm", Number(width)); renderPanel(); return; }
+    const preset = t.closest<HTMLElement>("[data-preset]")?.dataset.preset;
+    if (preset) {
+      const p = SIZE_PRESETS[Number(preset)];
+      P.settings.widthMm = p.widthMm;
+      if (P.settings.sizeMode === "board") P.settings.heightMm = p.heightMm;
+      sizeChanged(true);
+      return;
+    }
+    const mode = t.closest<HTMLElement>("[data-sizemode]")?.dataset.sizemode as SizeMode | undefined;
+    if (mode) { P.settings.sizeMode = mode; sizeChanged(true); return; }
+    const fit = t.closest<HTMLElement>("[data-fit]")?.dataset.fit as FitMode | undefined;
+    if (fit) { P.settings.fit = fit; sizeChanged(true); return; }
     const angle = t.closest<HTMLElement>("[data-angle]")?.dataset.angle;
     if (angle) { setSetting("vAngle", Number(angle)); renderPanel(); return; }
 
     const act = t.closest<HTMLElement>("[data-act]")?.dataset.act;
     if (!act) return;
     if (act === "pick") { $<HTMLInputElement>("#imageFile")?.click(); return; }
+    if (act === "swapWH") {
+      [P.settings.widthMm, P.settings.heightMm] = [P.settings.heightMm, P.settings.widthMm];
+      sizeChanged(true);
+      return;
+    }
     if (act === "clearImage") {
       P.image = null; P.imageName = null; result = null;
       prepareImage().then(() => { touch(true); renderAll(); });
@@ -937,13 +1072,12 @@ function bindPanel() {
 
   panel.oninput = (e) => {
     const t = e.target as HTMLInputElement;
-    const key = t.dataset.set as keyof Project["settings"] | undefined;
+    const key = t.dataset.set as NumericSetting | undefined;
     if (key) {
       const v = Number(t.value);
       if (t.value === "" || !Number.isFinite(v)) return;
       setSetting(key, v);
       if (key === "vAngle") $$<HTMLButtonElement>("[data-angle]", panel).forEach((b) => b.setAttribute("aria-pressed", String(Number(b.dataset.angle) === v)));
-      if (key === "widthMm") $$<HTMLButtonElement>("[data-width]", panel).forEach((b) => b.setAttribute("aria-pressed", String(Number(b.dataset.width) === v)));
       return;
     }
     const wood = woodFor(t);
@@ -974,6 +1108,7 @@ function woodFor(el: HTMLElement): Wood | undefined {
 }
 
 const reprepare = debounce(() => {
+  jobId++; // a job still running was for the old size: ignore its result
   prepareWork();
   result = null;
   renderStage();
@@ -981,14 +1116,20 @@ const reprepare = debounce(() => {
   scheduleProcess(0);
 }, 250);
 
-function setSetting(key: keyof Project["settings"], v: number) {
-  const limits: Record<keyof Project["settings"], [number, number]> = {
-    widthMm: [20, 2000], vAngle: [10, 150], pocketDepth: [0.2, 10], glueGap: [0, 3],
+function sizeChanged(rerender: boolean) {
+  touch(false);
+  if (rerender) renderPanel();
+  reprepare();
+}
+
+function setSetting(key: NumericSetting, v: number) {
+  const limits: Record<NumericSetting, [number, number]> = {
+    widthMm: [20, 2000], heightMm: [20, 2000], marginMm: [0, 200], vAngle: [10, 150], pocketDepth: [0.2, 10], glueGap: [0, 3],
     surfacePerRound: [0, 2], minRetained: [0.05, 5], simplify: [1, 4], colorWeight: [0, 1.5], smoothing: [0, 1],
   };
   const [lo, hi] = limits[key];
   P.settings[key] = clamp(v, lo, hi);
-  if (key === "widthMm") { touch(false); reprepare(); }
+  if (key === "widthMm" || key === "heightMm" || key === "marginMm") { sizeChanged(false); return; }
   else touch(true);
   refreshLive();
 }

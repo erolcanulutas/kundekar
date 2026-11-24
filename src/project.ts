@@ -27,7 +27,7 @@ export function newProject(name = "Untitled inlay"): Project {
   return {
     id: newUid(), name, created: now, updated: now, base, tones,
     settings: { ...DEFAULT_SETTINGS }, image: null, imageName: null,
-    step: "stock", done: {}, log: [{ t: now, text: "Project created" }],
+    step: "image", done: {}, log: [{ t: now, text: "Project created" }],
   };
 }
 
