@@ -19,7 +19,8 @@ export interface MachineSettings {
   glueGap: number; // extra plug depth so the plug bottoms out on the walls, mm
   surfacePerRound: number; // material removed by each surfacing pass, mm
   minRetained: number; // thinnest inlay edge still worth keeping, mm
-  simplify: number; // multiplier on the minimum feature size (1 = finest possible)
+  minLineMm: number; // thinnest line / narrowest region kept (never below what the bit can hold)
+  minAreaMm2: number; // islands smaller than this are filled by the surrounding wood
   colorWeight: number; // 0 = match by lightness only, 1+ = match hue strongly
   smoothing: number; // 0 = raw pixel edges, 1 = strongly rounded region borders
 }
@@ -40,7 +41,8 @@ export const DEFAULT_SETTINGS: MachineSettings = {
   glueGap: 0.5,
   surfacePerRound: 0.1,
   minRetained: 0.5,
-  simplify: 1.5,
+  minLineMm: 2,
+  minAreaMm2: 4,
   colorWeight: 0.35,
   smoothing: 0.7,
 };
@@ -80,7 +82,7 @@ export interface Derived {
   surfTotal: number; // worst case: removed above the first inlay after the last round
   needDepth: number; // depth an edge must reach to survive all surfacing
   minFeatureFine: number; // narrowest region the bit can hold at needDepth
-  minFeature: number; // after the simplification multiplier
+  minFeature: number; // what cleanup actually uses: max(user's thinnest line, bit limit)
   plugDepth: number;
   warnings: string[];
 }
@@ -91,7 +93,7 @@ export function derive(s: MachineSettings, base: Wood, tones: Wood[]): Derived {
   const surfTotal = rounds * s.surfacePerRound;
   const needDepth = s.minRetained + surfTotal;
   const minFeatureFine = 2 * tan * needDepth;
-  const minFeature = minFeatureFine * s.simplify;
+  const minFeature = Math.max(s.minLineMm, minFeatureFine);
   const plugDepth = s.pocketDepth + s.glueGap;
   const warnings: string[] = [];
 

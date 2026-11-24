@@ -179,6 +179,11 @@ async function save() {
 async function loadProject(p: Project) {
   P = p;
   P.settings = { ...DEFAULT_SETTINGS, ...p.settings }; // projects saved before a setting existed
+  const old = p.settings as Partial<typeof P.settings> & { simplify?: number };
+  if (old.minLineMm === undefined && old.simplify) {
+    // Before v0.2 the line width was "bit limit × simplification".
+    P.settings.minLineMm = Math.round(derive(P.settings, P.base, P.tones).minFeatureFine * old.simplify * 10) / 10;
+  }
   result = null;
   work = null;
   lastProjectId.set(p.id);
@@ -249,6 +254,7 @@ function runJob() {
     pxPerMm: work.ppm,
     woods: allWoods().map((w) => ({ color: w.color, figure: w.figure, seed: seedFor(w.uid) })),
     minFeatureMm: d.minFeature,
+    minAreaMm2: P.settings.minAreaMm2,
     colorWeight: P.settings.colorWeight,
     smoothing: P.settings.smoothing,
     sourcePx: work.sourcePx,
@@ -479,10 +485,14 @@ function renderMachine(): string {
 
 function renderSimplify(): string {
   const s = P.settings;
-  return `${head(4, "Simplify", "The image is reduced to your woods. Regions too narrow for the bit to hold are merged into the neighbour closest in color.")}
+  return `${head(4, "Simplify", "The image is reduced to your woods. Lines that are too thin and areas that are too small are merged into the woods around them.")}
     <div class="sec"><h3>Controls</h3>
-      <div class="field range"><label for="r-simplify">Simplification</label><output class="mono" data-live="simplifyOut"></output>
-        <input id="r-simplify" type="range" min="1" max="4" step="0.1" value="${s.simplify}" data-set="simplify" />
+      <div class="field range"><label for="r-line">Thinnest line</label><output class="mono" data-live="lineOut"></output>
+        <input id="r-line" type="range" min="0" max="10" step="0.1" value="${s.minLineMm}" data-set="minLineMm" />
+        <span class="hint">Lines, strips and necks thinner than this disappear into their neighbours. It never goes below what your bit can hold.</span></div>
+      <div class="field range"><label for="r-area">Smallest area</label><output class="mono" data-live="areaOut"></output>
+        <input id="r-area" type="range" min="0" max="100" step="0.5" value="${s.minAreaMm2}" data-set="minAreaMm2" />
+        <span class="hint">Dots and islands smaller than this are filled by the wood around them.</span></div>
         <span class="hint">× the narrowest feature your bit can hold. Higher = bolder shapes, fewer tiny islands.</span></div>
       <div class="field range"><label for="r-color">Match by</label><output class="mono" data-live="colorOut"></output>
         <input id="r-color" type="range" min="0" max="1.5" step="0.05" value="${s.colorWeight}" data-set="colorWeight" />
@@ -521,14 +531,17 @@ function refreshLive() {
       ${work.imgPerMm < 1.5 ? `<dt class="muted" style="grid-column:1/-1;font-size:12px">Low resolution for this size: edges will be smoothed. A larger image gives finer detail.</dt>` : ""}
       <dt>Working resolution</dt><dd>${work.w} × ${work.h} px</dd>
       <dt>Pixel size</dt><dd>${fmt(1 / work.ppm, 2)} mm</dd>
-      <dt>Smallest region at this size</dt><dd>${fmt(d.minFeature, 1)} mm</dd>`);
+      <dt>Thinnest line kept</dt><dd>${fmt(d.minFeature, 1)} mm</dd>`);
   } else {
     set("hOut", "after an image is added");
     set("size", `<dt class="muted">Add an image to see the board layout.</dt><dd></dd>`);
   }
 
   syncPlacementFields();
-  set("simplifyOut", `× ${fmt(P.settings.simplify, 1)} → ${fmt(d.minFeature, 1)} mm`);
+  set("lineOut", P.settings.minLineMm <= d.minFeatureFine
+    ? `${fmt(d.minFeatureFine, 1)} mm (bit limit)`
+    : `${fmt(P.settings.minLineMm, 1)} mm`);
+  set("areaOut", P.settings.minAreaMm2 <= 0 ? "off" : `${fmt(P.settings.minAreaMm2, 1)} mm² (⌀ ${fmt(2 * Math.sqrt(P.settings.minAreaMm2 / Math.PI), 1)} mm)`);
   set("smoothOut", P.settings.smoothing === 0 ? "off" : `${Math.round(P.settings.smoothing * 100)}%`);
   set("colorOut", P.settings.colorWeight < 0.15 ? "lightness" : P.settings.colorWeight > 0.9 ? "color" : "balanced");
 
@@ -1257,7 +1270,7 @@ function sizeChanged(rerender: boolean) {
 function setSetting(key: NumericSetting, v: number) {
   const limits: Record<NumericSetting, [number, number]> = {
     widthMm: [20, 2000], heightMm: [20, 2000], marginMm: [0, 200], imgX: [-5000, 5000], imgY: [-5000, 5000], imgWidthMm: [5, 5000], vAngle: [10, 150], pocketDepth: [0.2, 10], glueGap: [0, 3],
-    surfacePerRound: [0, 2], minRetained: [0.05, 5], simplify: [1, 4], colorWeight: [0, 1.5], smoothing: [0, 1],
+    surfacePerRound: [0, 2], minRetained: [0.05, 5], minLineMm: [0, 10], minAreaMm2: [0, 100], colorWeight: [0, 1.5], smoothing: [0, 1],
   };
   const [lo, hi] = limits[key];
   P.settings[key] = clamp(v, lo, hi);

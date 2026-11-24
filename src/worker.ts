@@ -12,6 +12,7 @@ export interface JobRequest {
   pxPerMm: number;
   woods: RenderWood[];
   minFeatureMm: number;
+  minAreaMm2: number;
   colorWeight: number;
   smoothing: number;
   sourcePx: number;
@@ -38,6 +39,7 @@ self.onmessage = (e: MessageEvent<JobRequest>) => {
       pxPerMm: q.pxPerMm,
       woodLabs: q.woods.map((w) => hexToLab(w.color)),
       minFeatureMm: q.minFeatureMm,
+      minAreaMm2: q.minAreaMm2,
       colorWeight: q.colorWeight,
       smoothing: q.smoothing,
       sourcePx: q.sourcePx,
