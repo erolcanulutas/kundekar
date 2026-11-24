@@ -49,12 +49,22 @@ function clamp(v: number, lo: number, hi: number): number {
   return Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : lo;
 }
 
-function toast(msg: string) {
+// No native confirm(): browsers let users silence it, after which it always
+// returns false. Changes apply immediately and the toast offers Undo instead.
+function toast(msg: string, action?: { label: string; run: () => void }) {
+  document.querySelectorAll(".toast").forEach((x) => x.remove());
   const t = document.createElement("div");
   t.className = "toast";
-  t.textContent = msg;
+  t.setAttribute("role", "status");
+  t.append(msg);
+  if (action) {
+    const b = document.createElement("button");
+    b.textContent = action.label;
+    b.onclick = () => { t.remove(); action.run(); };
+    t.append(b);
+  }
   document.body.append(t);
-  setTimeout(() => t.remove(), 2600);
+  setTimeout(() => t.remove(), action ? 8000 : 2600);
 }
 
 function download(blob: Blob, name: string) {
@@ -100,7 +110,7 @@ const STEPS: Step[] = [
   { id: "machine", title: "Bit & depths", sub: "V-bit, pocket, surfacing", phase: "Setup", view: "inlay", blocker: () => null, render: renderMachine },
   {
     id: "simplify", title: "Simplify", sub: "Wood regions", phase: "Setup", view: "inlay",
-    blocker: () => "Round planning and G-code are the next milestones. Your setup is saved until then.",
+    blocker: () => "Rounds (step 5) is not built yet: it is the next milestone (MVP 2). Your setup is saved.",
     render: renderSimplify,
   },
   {
@@ -655,8 +665,15 @@ async function openProjects() {
     if (open) { const p = await store.get(open); if (p) { await save(); dlg.close(); await loadProject(p); } }
     const del = t.closest<HTMLElement>("[data-del]")?.dataset.del;
     if (del) {
-      const p = list.find((x) => x.id === del)!;
-      if (!confirm(`Delete "${p.name}"? This cannot be undone. Export it first if you want a backup.`)) return;
+      const btn = t.closest<HTMLButtonElement>("[data-del]")!;
+      if (!btn.dataset.armed) {
+        // Two-step delete: first click arms the button.
+        btn.dataset.armed = "1";
+        btn.textContent = "Click again to delete";
+        btn.classList.remove("ghost");
+        setTimeout(() => { if (btn.isConnected) { delete btn.dataset.armed; btn.textContent = "Delete"; btn.classList.add("ghost"); } }, 4000);
+        return;
+      }
       await store.remove(del);
       dlg.close();
       if (del === P.id) {
@@ -780,11 +797,15 @@ function bindPanel() {
     const kit = t.closest<HTMLElement>("[data-kit]")?.dataset.kit;
     if (kit) {
       const k = WOOD_KITS.find((x) => x.id === kit)!;
-      if (!confirm(`Replace your boards with the "${k.name}" kit?`)) return;
+      const before = { base: P.base, tones: P.tones };
       const { base, tones } = woodsFromKit(k);
       P.base = base; P.tones = tones;
       P.log.push({ t: Date.now(), text: `Kit: ${k.name}` });
       refreshAfterWoodChange(true);
+      toast(`"${k.name}" applied`, {
+        label: "Undo",
+        run: () => { P.base = before.base; P.tones = before.tones; refreshAfterWoodChange(true); },
+      });
       return;
     }
     const width = t.closest<HTMLElement>("[data-width]")?.dataset.width;
