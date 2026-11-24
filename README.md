@@ -19,13 +19,17 @@ cure between rounds), so everything is saved in your browser automatically. Use
 
 | Step | What happens |
 |---|---|
-| 1. Wood stock | Choose base and tone woods from presets (or custom colors) with their thickness. |
-| 2. Image & size | Add artwork; set the finished width. Height follows the image. |
+| 1. Image & size | Add artwork; set the base board size and place the image on it. Optional AI background removal. |
+| 2. Wood stock | Choose base and tone woods from presets (or custom colors) with their thickness. |
 | 3. Bit & depths | V-bit angle, pocket depth, glue gap, surfacing per round. Shows the narrowest region the bit can hold, with a to-scale cross-section. |
-| 4. Simplify | The image is reduced to your woods; regions too narrow to inlay are merged away. Real-scale, wood-textured preview. |
-| 5. Rounds | *Coming:* pocket → plug → glue → surface for each round, with G-code files. |
+| 4. Simplify | The image is reduced to your woods; lines thinner and areas smaller than your limits are merged away. Vector preview, SVG export. |
+| 5. Refine | Fix regions by hand: fill, remove, brush, lasso. Edits are re-applied when woods or settings change. |
+| 6. Rounds | *Coming:* pocket → plug → glue → surface for each round, with G-code files. |
 
-Everything runs locally in the browser. Images are never uploaded.
+Everything runs locally in the browser. Images are never uploaded. AI background removal uses
+[ORMBG](https://huggingface.co/onnx-community/ormbg-ONNX) (Apache-2.0) via
+[transformers.js](https://github.com/huggingface/transformers.js); the model (~45 MB) is
+downloaded from Hugging Face on first use and cached.
 
 ## Roadmap
 

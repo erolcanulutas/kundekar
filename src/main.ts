@@ -3,6 +3,8 @@ import {
   boardLayout, DEFAULT_SETTINGS, derive, fmt, pxPerMm, SIZE_PRESETS, V_ANGLES, type Derived, type FitMode, type NumericSetting, type SizeMode,
 } from "./core/machine";
 import { loopToPath2D, loopToSvg, type WoodOutline } from "./core/vectorize";
+import type { Edit, PxEdit } from "./core/edits";
+import { removeBackground } from "./ai";
 import { paintSeamlessTile, paintSwatch, seedFor } from "./core/grain";
 import { planRounds, type SimplifyResult } from "./core/simplify";
 import {
@@ -34,6 +36,18 @@ let customScale = 1; // screen px per mm when zoom === "custom"
 let busy = false;
 let pending = false;
 let jobId = 0;
+let workVersion = 0; // bumps whenever the working image changes
+let sentKey = ""; // base key of the image the worker last received
+let maskBitmap: ImageBitmap | null = null;
+let maskOf: Blob | null = null;
+let aiStatus = "";
+
+type Tool = "fill" | "merge" | "brush" | "lasso";
+let tool: Tool = "fill";
+let activeWood = ""; // uid
+let brushMm = 3;
+let redo: Edit[] = [];
+let spaceHeld = false;
 
 const CAL_KEY = "kundekar.cssPxPerMm";
 let cssPxPerMm = Number(localStorage.getItem(CAL_KEY)) || 96 / 25.4;
@@ -114,8 +128,12 @@ const STEPS: Step[] = [
   { id: "machine", title: "Bit & depths", sub: "V-bit, pocket, surfacing", phase: "Setup", view: "inlay", blocker: () => null, render: renderMachine },
   {
     id: "simplify", title: "Simplify", sub: "Wood regions", phase: "Setup", view: "inlay",
-    blocker: () => "Rounds (step 5) is not built yet: it is the next milestone (MVP 2). Your setup is saved.",
-    render: renderSimplify,
+    blocker: () => (work ? null : "Add an image in step 1 first."), render: renderSimplify,
+  },
+  {
+    id: "refine", title: "Refine", sub: "Fix regions by hand", phase: "Setup", view: "woods",
+    blocker: () => "Rounds (step 6) is not built yet: it is the next milestone (MVP 2). Your setup is saved.",
+    render: renderRefine,
   },
   {
     id: "rounds", title: "Rounds", sub: "Pocket · plug · glue · surface", phase: "Workshop", view: "inlay",
@@ -130,7 +148,7 @@ function stepIndex(id = P.step) {
 /** A step can be opened when every step before it can be left. */
 function reachable(i: number): boolean {
   if (STEPS[i].id === "rounds") return false;
-  for (let j = 0; j < i; j++) if (STEPS[j].blocker() && STEPS[j].id !== "simplify") return false;
+  for (let j = 0; j < i; j++) if (STEPS[j].blocker() && STEPS[j].id !== "refine") return false;
   return true;
 }
 
@@ -184,6 +202,10 @@ async function loadProject(p: Project) {
     // Before v0.2 the line width was "bit limit × simplification".
     P.settings.minLineMm = Math.round(derive(P.settings, P.base, P.tones).minFeatureFine * old.simplify * 10) / 10;
   }
+  P.edits ??= [];
+  P.mask ??= null;
+  P.maskOn ??= false;
+  redo = [];
   result = null;
   work = null;
   lastProjectId.set(p.id);
@@ -209,6 +231,10 @@ async function prepareImage() {
     if (imageUrl) URL.revokeObjectURL(imageUrl);
     imageUrl = URL.createObjectURL(P.image);
   }
+  if (maskOf !== P.mask) {
+    maskBitmap = P.mask ? await createImageBitmap(P.mask) : null;
+    maskOf = P.mask;
+  }
   prepareWork();
 }
 
@@ -227,7 +253,14 @@ function prepareWork() {
   ctx.rect(g.art.x * sx, g.art.y * sy, g.art.w * sx, g.art.h * sy);
   ctx.clip(); // "fill" crops to the artwork area; the border stays transparent = base wood
   ctx.drawImage(bitmap, g.draw.x * sx, g.draw.y * sy, g.draw.w * sx, g.draw.h * sy);
+  if (P.maskOn && maskBitmap) {
+    // Background removed: keep the subject; the rest turns transparent = base wood.
+    ctx.globalCompositeOperation = "destination-in";
+    ctx.drawImage(maskBitmap, g.draw.x * sx, g.draw.y * sy, g.draw.w * sx, g.draw.h * sy);
+    ctx.globalCompositeOperation = "source-over";
+  }
   ctx.restore();
+  workVersion++;
   work = {
     w, h, ppm: sx, wMm: g.wMm, hMm: g.hMm, rgba: ctx.getImageData(0, 0, w, h),
     sourcePx: Math.max(1, (g.draw.w * sx) / bitmap.width), imgPerMm: bitmap.width / g.draw.w,
@@ -246,29 +279,55 @@ function runJob() {
   busy = true;
   pending = false;
   const d = derive(P.settings, P.base, P.tones);
+  const woods = allWoods();
+  // Everything except the hand edits: if unchanged, the worker reuses its regions.
+  const baseKey = JSON.stringify([workVersion, P.settings, woods.map((w) => [w.uid, w.color]), d.minFeature]);
   const req: JobRequest = {
     id: ++jobId,
-    rgba: work.rgba.data.slice(),
+    baseKey,
+    rgba: baseKey === sentKey ? null : work.rgba.data.slice(),
+    edits: resolveEdits(),
     width: work.w,
     height: work.h,
     pxPerMm: work.ppm,
-    woods: allWoods().map((w) => ({ color: w.color, figure: w.figure, seed: seedFor(w.uid) })),
+    woods: woods.map((w) => ({ color: w.color, figure: w.figure, seed: seedFor(w.uid) })),
     minFeatureMm: d.minFeature,
     minAreaMm2: P.settings.minAreaMm2,
     colorWeight: P.settings.colorWeight,
     smoothing: P.settings.smoothing,
     sourcePx: work.sourcePx,
   };
-  worker.postMessage(req, [req.rgba.buffer]);
+  sentKey = baseKey;
+  worker.postMessage(req, req.rgba ? [req.rgba.buffer] : []);
   updateStatus();
+}
+
+/** Hand edits in working pixels; edits for a removed wood are skipped. */
+function resolveEdits(): PxEdit[] {
+  const g = placement();
+  if (!g || !work) return [];
+  const index = new Map(allWoods().map((w, i) => [w.uid, i]));
+  const ppm = work.ppm, X = (u: number) => (g.draw.x + u * g.draw.w) * ppm, Y = (v: number) => (g.draw.y + v * g.draw.h) * ppm;
+  const px = (pts: number[]) => pts.map((t, i) => (i % 2 ? Y(t) : X(t)));
+  const out: PxEdit[] = [];
+  for (const e of P.edits) {
+    if (e.t === "merge") { out.push({ t: "merge", x: X(e.u), y: Y(e.v) }); continue; }
+    const lab = index.get(e.wood);
+    if (lab === undefined) continue;
+    if (e.t === "fill") out.push({ t: "fill", x: X(e.u), y: Y(e.v), lab });
+    else if (e.t === "brush") out.push({ t: "brush", pts: px(e.pts), r: e.r * g.draw.w * ppm, lab });
+    else out.push({ t: "lasso", pts: px(e.pts), lab });
+  }
+  return out;
 }
 
 worker.onmessage = (e: MessageEvent<JobResponse>) => {
   const r = e.data;
   busy = false;
+  if (r.needRgba) { sentKey = ""; runJob(); return; } // worker lost its cache: send the image again
   if (r.error) {
     toast("Processing failed: " + r.error);
-  } else if (r.id === jobId && work && r.result && r.flat && r.inlay && r.outlines && r.flat.length === work.w * work.h * 4) {
+  } else if (r.id === jobId && work && r.result && r.flat && r.inlay && r.outlines && r.flat.length === work.w * work.h * 4 && r.result.stats.length === allWoods().length) {
     const firstResult = !result;
     result = {
       res: r.result,
@@ -280,6 +339,7 @@ worker.onmessage = (e: MessageEvent<JobResponse>) => {
     };
     if (firstResult && P.step !== "image") view = STEPS[stepIndex()].view;
     renderStage();
+    clearInk();
     refreshLive();
   }
   if (pending) runJob();
@@ -433,6 +493,13 @@ function renderImage(): string {
   ];
   return `${head(1, "Image & size", "Detailed artwork is welcome: it will be reduced to your woods in step 4. Size the base board to match the image, or enter your board and place the image on it.")}
     <div class="sec"><h3>Artwork</h3>${img}<input type="file" id="imageFile" accept="image/*" hidden /></div>
+    ${P.image ? `<div class="sec"><h3>Background <span>AI · runs in your browser</span></h3>
+      ${P.mask
+        ? `<label class="check"><input type="checkbox" data-act="maskOn" ${P.maskOn ? "checked" : ""} /> Remove background (keep the subject only)</label>
+           <p style="margin:6px 0 0"><button class="btn small ghost danger" data-act="dropMask">Discard the mask</button></p>`
+        : `<button class="btn small" data-act="removeBg" ${aiStatus ? "disabled" : ""}>✦ Remove background</button>`}
+      <p class="hint" data-live="aiStatus">${aiStatus ? esc(aiStatus) : "Finds the person (or main subject); everything else becomes base wood. Works best on people and clear subjects. The first use downloads a ~45 MB model; your image is never uploaded."}</p>
+    </div>` : ""}
     <div class="sec"><h3>Base board size</h3>
       <div class="field"><span class="seg" role="group" aria-label="Size mode">${modes.map(([m, l]) => `<button data-sizemode="${m}" aria-pressed="${s.sizeMode === m}">${l}</button>`).join("")}</span></div>
       <div class="chips" style="margin-bottom:12px">${chips}</div>
@@ -504,6 +571,60 @@ function renderSimplify(): string {
     <div class="sec"><h3>Wood usage</h3><div data-live="stats"></div></div>
     <div class="sec"><h3>Round plan <span>preview</span></h3><div data-live="rounds"></div></div>
     <div class="sec" data-live="warns"></div>`;
+}
+
+const TOOLS: [Tool, string, string][] = [
+  ["fill", "Fill", "Click a region to change it to the selected wood."],
+  ["merge", "Remove", "Click a region to remove it: the wood around it fills in."],
+  ["brush", "Brush", "Paint with the selected wood."],
+  ["lasso", "Lasso", "Draw around an area to turn it all into the selected wood, e.g. the base wood to clear a background."],
+];
+
+function renderRefine(): string {
+  const woods = allWoods();
+  if (!woods.some((w) => w.uid === activeWood)) activeWood = woods[1]?.uid ?? woods[0].uid;
+  const palette = woods.map((w, i) => `<button class="woodpick" data-pick-wood="${w.uid}" aria-pressed="${w.uid === activeWood}">
+      <span class="dot" style="background:${w.color}"></span>${esc(w.name)}${i === 0 ? ' <span class="muted">(base)</span>' : ""}</button>`).join("");
+  return `${head(5, "Refine", "Fix what the automatic pass got wrong. Edits stay attached to the image and are re-applied when you change woods or settings. The thinnest-line and smallest-area rules still apply.")}
+    <div class="sec"><h3>Tool</h3>
+      <div class="field"><span class="seg" role="group" aria-label="Tool">${TOOLS.map(([t, l]) => `<button data-tool="${t}" aria-pressed="${t === tool}">${l}</button>`).join("")}</span>
+      <span class="hint">${TOOLS.find((t) => t[0] === tool)![2]} Hold <kbd>Space</kbd> and drag (or use the middle button) to pan; the wheel zooms.</span></div>
+    </div>
+    ${tool === "merge" ? "" : `<div class="sec"><h3>Wood</h3><div class="palette">${palette}</div></div>`}
+    ${tool === "brush" ? `<div class="sec"><div class="field range"><label for="r-brush">Brush size</label><output class="mono">${fmt(brushMm * 2, 1)} mm</output>
+      <input id="r-brush" type="range" min="0.5" max="20" step="0.5" value="${brushMm}" data-brush /></div></div>` : ""}
+    <div class="sec"><h3>History <span>${P.edits.length} edit${P.edits.length === 1 ? "" : "s"}</span></h3>
+      <p style="margin:0;display:flex;gap:6px;flex-wrap:wrap">
+        <button class="btn small" data-act="undo" ${P.edits.length ? "" : "disabled"} title="Ctrl+Z">↶ Undo</button>
+        <button class="btn small" data-act="redo" ${redo.length ? "" : "disabled"} title="Ctrl+Y">↷ Redo</button>
+        <button class="btn small ghost danger" data-act="clearEdits" ${P.edits.length ? "" : "disabled"}>Clear all edits</button></p>
+    </div>
+    <div class="sec"><h3>Wood usage</h3><div data-live="stats"></div></div>
+    <div class="sec" data-live="warns"></div>`;
+}
+
+function pushEdit(e: Edit) {
+  P.edits.push(e);
+  redo = [];
+  touch(false);
+  scheduleProcess(0);
+  if (P.step === "refine") renderPanel();
+}
+
+function undoEdit() {
+  const e = P.edits.pop();
+  if (!e) return;
+  redo.push(e);
+  touch(false); scheduleProcess(0);
+  if (P.step === "refine") renderPanel();
+}
+
+function redoEdit() {
+  const e = redo.pop();
+  if (!e) return;
+  P.edits.push(e);
+  touch(false); scheduleProcess(0);
+  if (P.step === "refine") renderPanel();
 }
 
 // ---------------------------------------------------------------- live readouts
@@ -645,6 +766,7 @@ function renderStage() {
   if (!$("canvas.view", scroll)) {
     scroll.innerHTML = `<div class="stage-grid"><div class="corner">mm</div><canvas class="rx"></canvas><canvas class="ry"></canvas>
       <div class="viewbox"><canvas class="view"></canvas><canvas class="vec" aria-hidden="true"></canvas>
+        <svg class="ink" preserveAspectRatio="none" aria-hidden="true"><path class="stroke"/><circle class="cursor" r="0"/></svg>
         <div class="artbox"></div>
         <div class="placer" title="Drag to move · drag a corner to resize"><i data-h="nw"></i><i data-h="ne"></i><i data-h="sw"></i><i data-h="se"></i><span class="pl-dim"></span></div>
       </div></div>`;
@@ -664,6 +786,7 @@ function renderStage() {
     ctx.putImageData(view === "woods" ? result.flat : result.inlay, 0, 0);
   }
   layoutStage();
+  updateToolCursor();
   updateStatus();
 }
 
@@ -679,6 +802,7 @@ function layoutStage() {
   grid.style.marginTop = `${Math.max(0, (scroll.clientHeight - H - R - 24) / 2)}px`;
   const vb = $<HTMLElement>(".viewbox", grid)!;
   vb.style.width = W + "px"; vb.style.height = H + "px";
+  $(".ink", vb)?.setAttribute("viewBox", `0 0 ${work.wMm} ${work.hMm}`);
   drawRuler($<HTMLCanvasElement>("canvas.rx", grid)!, W, R, scale, true);
   drawRuler($<HTMLCanvasElement>("canvas.ry", grid)!, H, R, scale, false);
   drawVector();
@@ -902,6 +1026,7 @@ function bindStageScroll() {
   scroll.addEventListener("pointerdown", (e) => {
     if (!work || (e.button !== 0 && e.button !== 1)) return;
     if (!(e.target as Element).closest(".stage-grid")) return; // leave the scrollbars alone
+    if (P.step === "refine" && e.button === 0 && !spaceHeld) return; // the refine tools own the left button
     drag = { x: e.clientX, y: e.clientY, sl: scroll.scrollLeft, st: scroll.scrollTop, id: e.pointerId };
     scroll.setPointerCapture(e.pointerId);
     scroll.classList.add("panning");
@@ -916,6 +1041,86 @@ function bindStageScroll() {
   scroll.addEventListener("pointercancel", end);
   scroll.addEventListener("dblclick", () => work && setZoom("fit"));
   scroll.addEventListener("scroll", requestVector, { passive: true });
+  bindTools(scroll);
+}
+
+// ---- Refine tools on the stage
+
+function clearInk() {
+  $(".ink .stroke")?.setAttribute("d", "");
+}
+
+function updateToolCursor() {
+  const scroll = $(".stage-scroll");
+  scroll?.classList.toggle("toolmode", P.step === "refine" && !spaceHeld);
+  scroll?.classList.toggle("spacepan", P.step === "refine" && spaceHeld);
+  if (P.step !== "refine" || tool !== "brush") $(".ink .cursor")?.setAttribute("r", "0");
+}
+
+function bindTools(scroll: HTMLElement) {
+  const toMm = (e: PointerEvent) => {
+    const r = $(".viewbox")!.getBoundingClientRect(), s = currentScale();
+    return [(e.clientX - r.left) / s, (e.clientY - r.top) / s];
+  };
+  const toUv = (x: number, y: number) => {
+    const g = placement()!;
+    return [(x - g.draw.x) / g.draw.w, (y - g.draw.y) / g.draw.h];
+  };
+  let stroke: { pts: number[]; id: number } | null = null; // mm
+  const woodColor = () => allWoods().find((w) => w.uid === activeWood)?.color ?? "#000";
+  const drawStroke = () => {
+    const path = $(".ink .stroke");
+    if (!path || !stroke) return;
+    const p = stroke.pts;
+    let d = `M${p[0]} ${p[1]}`;
+    for (let i = 2; i < p.length; i += 2) d += `L${p[i]} ${p[i + 1]}`;
+    if (tool === "brush") {
+      if (p.length === 2) d += `L${p[0] + 0.01} ${p[1]}`;
+      Object.assign(path.style, { stroke: woodColor(), strokeWidth: `${brushMm * 2}`, fill: "none", strokeDasharray: "", opacity: "0.85" });
+    } else {
+      d += "Z";
+      Object.assign(path.style, { stroke: "#1c6b66", strokeWidth: "", fill: woodColor(), strokeDasharray: "4 3", opacity: "0.6" });
+    }
+    path.setAttribute("d", d);
+  };
+  scroll.addEventListener("pointerdown", (e) => {
+    if (P.step !== "refine" || e.button !== 0 || spaceHeld || !work || !result || !bitmap) return;
+    if (!(e.target as Element).closest(".viewbox")) return;
+    e.preventDefault();
+    const [x, y] = toMm(e);
+    const [u, v] = toUv(x, y);
+    if (tool === "fill") { pushEdit({ t: "fill", u, v, wood: activeWood }); return; }
+    if (tool === "merge") { pushEdit({ t: "merge", u, v }); return; }
+    stroke = { pts: [x, y], id: e.pointerId };
+    scroll.setPointerCapture(e.pointerId);
+    drawStroke();
+  });
+  scroll.addEventListener("pointermove", (e) => {
+    if (P.step !== "refine" || !work) return;
+    const [x, y] = toMm(e);
+    const cur = $(".ink .cursor");
+    if (cur && tool === "brush" && !spaceHeld) {
+      cur.setAttribute("cx", String(x)); cur.setAttribute("cy", String(y)); cur.setAttribute("r", String(brushMm));
+    }
+    if (!stroke || e.pointerId !== stroke.id) return;
+    const p = stroke.pts, lx = p[p.length - 2], ly = p[p.length - 1];
+    if (Math.hypot(x - lx, y - ly) < 0.25) return;
+    p.push(x, y);
+    drawStroke();
+  });
+  const end = (e: PointerEvent) => {
+    if (!stroke || e.pointerId !== stroke.id) return;
+    const uv: number[] = [];
+    for (let i = 0; i < stroke.pts.length; i += 2) uv.push(...toUv(stroke.pts[i], stroke.pts[i + 1]));
+    const g = placement()!;
+    if (tool === "brush") pushEdit({ t: "brush", pts: uv, r: brushMm / g.draw.w, wood: activeWood });
+    else if (uv.length >= 6) pushEdit({ t: "lasso", pts: uv, wood: activeWood });
+    else clearInk();
+    stroke = null;
+  };
+  scroll.addEventListener("pointerup", end);
+  scroll.addEventListener("pointercancel", end);
+  scroll.addEventListener("pointerleave", () => $(".ink .cursor")?.setAttribute("r", "0"));
 }
 
 function drawRuler(c: HTMLCanvasElement, len: number, thick: number, scale: number, horiz: boolean) {
@@ -1093,6 +1298,8 @@ function bindShell() {
 }
 
 function refreshAfterWoodChange(rerender: boolean) {
+  // A result computed for a different number of woods can't be drawn any more.
+  if (result && result.res.stats.length !== allWoods().length) { result = null; renderStage(); }
   touch(true);
   if (rerender) renderPanel(); else refreshLive();
 }
@@ -1106,6 +1313,10 @@ function bindPanel() {
 
   panel.onclick = (e) => {
     const t = e.target as HTMLElement;
+    const tl = t.closest<HTMLElement>("[data-tool]")?.dataset.tool as Tool | undefined;
+    if (tl) { tool = tl; renderPanel(); updateToolCursor(); return; }
+    const pick = t.closest<HTMLElement>("[data-pick-wood]")?.dataset.pickWood;
+    if (pick) { activeWood = pick; renderPanel(); return; }
     const kit = t.closest<HTMLElement>("[data-kit]")?.dataset.kit;
     if (kit) {
       const k = WOOD_KITS.find((x) => x.id === kit)!;
@@ -1142,6 +1353,27 @@ function bindPanel() {
     const act = t.closest<HTMLElement>("[data-act]")?.dataset.act;
     if (!act) return;
     if (act === "pick") { $<HTMLInputElement>("#imageFile")?.click(); return; }
+    if (act === "undo") { undoEdit(); return; }
+    if (act === "redo") { redoEdit(); return; }
+    if (act === "clearEdits") {
+      const btn = t.closest<HTMLButtonElement>("[data-act]")!;
+      if (!btn.dataset.armed) {
+        btn.dataset.armed = "1"; btn.textContent = "Click again to clear all";
+        setTimeout(() => { if (btn.isConnected) { delete btn.dataset.armed; btn.textContent = "Clear all edits"; } }, 4000);
+        return;
+      }
+      redo = [...P.edits].reverse();
+      P.edits = [];
+      touch(false); scheduleProcess(0); renderPanel();
+      toast("All edits cleared", { label: "Undo", run: () => { P.edits = [...redo].reverse(); redo = []; touch(false); scheduleProcess(0); renderPanel(); } });
+      return;
+    }
+    if (act === "removeBg") { runRemoveBackground(); return; }
+    if (act === "dropMask") {
+      P.mask = null; P.maskOn = false;
+      prepareImage().then(() => sizeChanged(true));
+      return;
+    }
     if (act === "centerImg") {
       toCustom();
       const g = placement();
@@ -1184,6 +1416,11 @@ function bindPanel() {
 
   panel.onchange = (e) => {
     const t = e.target as HTMLInputElement;
+    if (t.dataset.act === "maskOn") {
+      P.maskOn = t.checked;
+      sizeChanged(false);
+      return;
+    }
     if (t.id === "imageFile") {
       const f = t.files?.[0];
       if (f) setImage(f, f.name);
@@ -1202,6 +1439,12 @@ function bindPanel() {
 
   panel.oninput = (e) => {
     const t = e.target as HTMLInputElement;
+    if (t.hasAttribute("data-brush")) {
+      brushMm = Number(t.value);
+      const o = t.closest(".field")?.querySelector("output");
+      if (o) o.textContent = `${fmt(brushMm * 2, 1)} mm`;
+      return;
+    }
     const place = t.dataset.place as "imgWidthMm" | "imgX" | "imgY" | undefined;
     if (place) {
       const v = Number(t.value);
@@ -1261,6 +1504,26 @@ const reprepare = debounce(() => {
   scheduleProcess(0);
 }, 250);
 
+async function runRemoveBackground() {
+  if (!P.image || aiStatus) return;
+  const status = (text: string) => { aiStatus = text; $$('[data-live="aiStatus"]').forEach((el) => (el.textContent = text)); };
+  status("Starting…");
+  if (P.step === "image") renderPanel();
+  try {
+    P.mask = await removeBackground(P.image, status);
+    P.maskOn = true;
+    P.log.push({ t: Date.now(), text: "Background removed (AI)" });
+    aiStatus = "";
+    await prepareImage();
+    sizeChanged(P.step === "image");
+    toast("Background removed. Untick the box to bring it back.");
+  } catch (err) {
+    aiStatus = "";
+    if (P.step === "image") renderPanel();
+    toast("Background removal failed: " + (err instanceof Error ? err.message : String(err)));
+  }
+}
+
 function sizeChanged(rerender: boolean) {
   touch(false);
   if (rerender) renderPanel();
@@ -1297,6 +1560,16 @@ window.addEventListener("paste", (e) => {
   if (f) setImage(f, f.name || "Pasted image");
 });
 window.addEventListener("resize", debounce(layoutStage, 100));
+const typing = (t: EventTarget | null) => t instanceof HTMLElement && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName));
+window.addEventListener("keydown", (e) => {
+  if (typing(e.target)) return;
+  if (e.code === "Space" && P?.step === "refine" && !spaceHeld) { spaceHeld = true; updateToolCursor(); e.preventDefault(); }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && !e.shiftKey) { e.preventDefault(); undoEdit(); }
+  if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === "y" || (e.key.toLowerCase() === "z" && e.shiftKey))) { e.preventDefault(); redoEdit(); }
+});
+window.addEventListener("keyup", (e) => {
+  if (e.code === "Space" && spaceHeld) { spaceHeld = false; updateToolCursor(); }
+});
 window.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && (e.target as HTMLElement).closest?.(".drop")) $<HTMLInputElement>("#imageFile")?.click();
 });

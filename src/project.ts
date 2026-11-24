@@ -1,6 +1,7 @@
 // Projects live for days (glue has to cure between rounds), so everything
 // is autosaved to IndexedDB and can be exported to / imported from a file.
 
+import type { Edit } from "./core/edits";
 import { DEFAULT_SETTINGS, type MachineSettings } from "./core/machine";
 import { newUid, WOOD_KITS, woodsFromKit, type Wood } from "./core/woods";
 
@@ -16,6 +17,9 @@ export interface Project {
   settings: MachineSettings;
   image: Blob | null;
   imageName: string | null;
+  mask: Blob | null; // AI subject mask (alpha = keep), same size as the image
+  maskOn: boolean;
+  edits: Edit[];
   step: string; // id of the step the user is on
   done: Record<string, number>; // step id -> time it was marked done
   log: { t: number; text: string }[];
@@ -26,7 +30,7 @@ export function newProject(name = "Untitled inlay"): Project {
   const now = Date.now();
   return {
     id: newUid(), name, created: now, updated: now, base, tones,
-    settings: { ...DEFAULT_SETTINGS }, image: null, imageName: null,
+    settings: { ...DEFAULT_SETTINGS }, image: null, imageName: null, mask: null, maskOn: false, edits: [],
     step: "image", done: {}, log: [{ t: now, text: "Project created" }],
   };
 }
@@ -67,9 +71,10 @@ export const lastProjectId = {
 
 // ---- File export / import -------------------------------------------------
 
-interface ProjectFile extends Omit<Project, "image"> {
+interface ProjectFile extends Omit<Project, "image" | "mask"> {
   kundekar: number;
   image: string | null; // data URL
+  mask?: string | null; // data URL
 }
 
 function blobToDataUrl(b: Blob): Promise<string> {
@@ -82,7 +87,11 @@ function blobToDataUrl(b: Blob): Promise<string> {
 }
 
 export async function exportProject(p: Project): Promise<Blob> {
-  const file: ProjectFile = { ...p, kundekar: FILE_VERSION, image: p.image ? await blobToDataUrl(p.image) : null };
+  const file: ProjectFile = {
+    ...p, kundekar: FILE_VERSION,
+    image: p.image ? await blobToDataUrl(p.image) : null,
+    mask: p.mask ? await blobToDataUrl(p.mask) : null,
+  };
   return new Blob([JSON.stringify(file)], { type: "application/json" });
 }
 
@@ -93,9 +102,13 @@ export async function importProject(f: File): Promise<Project> {
   }
   if (data.kundekar > FILE_VERSION) throw new Error("This project was saved by a newer version of Kundekar.");
   const image = data.image ? await (await fetch(data.image)).blob() : null;
+  const mask = data.mask ? await (await fetch(data.mask)).blob() : null;
   const { kundekar: _v, ...rest } = data;
   return {
     ...rest,
+    mask,
+    maskOn: !!(mask && rest.maskOn),
+    edits: rest.edits ?? [],
     settings: { ...DEFAULT_SETTINGS, ...rest.settings },
     image,
     id: newUid(), // never overwrite an existing project silently

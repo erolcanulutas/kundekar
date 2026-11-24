@@ -302,3 +302,17 @@ dialog::backdrop { background: rgba(35, 28, 21, 0.55); }
   .brand small { display: none; }
 }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+
+/* ---- Refine tools ---- */
+.stage-grid svg.ink { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
+.ink .stroke { stroke-linecap: round; stroke-linejoin: round; vector-effect: none; }
+.ink .cursor { fill: none; stroke: #fff; stroke-width: 1.5px; vector-effect: non-scaling-stroke; filter: drop-shadow(0 0 1px #000); }
+.stage-scroll.toolmode { cursor: crosshair; }
+.stage-scroll.spacepan { cursor: grab; }
+.palette { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.woodpick { text-align: left; border: 1px solid var(--rule); background: var(--card); border-radius: var(--r); padding: 6px 8px; cursor: pointer; font-size: 12.5px; }
+.woodpick:hover { border-color: var(--ink); }
+.woodpick[aria-pressed="true"] { border: 2px solid var(--turq); padding: 5px 7px; background: var(--turq-soft); }
+.check { display: flex; gap: 8px; align-items: center; font-weight: 500; cursor: pointer; }
+.check input { accent-color: var(--turq); width: 16px; height: 16px; }
+kbd { font: 11px var(--mono); border: 1px solid var(--rule); border-bottom-width: 2px; border-radius: 3px; padding: 0 4px; background: var(--card); }

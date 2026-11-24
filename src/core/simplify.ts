@@ -8,6 +8,7 @@
 // Pure functions: runs in a worker, and later in a Node CLI.
 
 import { rgbToLab, type Lab } from "./color";
+import { applyEdits, type PxEdit } from "./edits";
 
 export interface SimplifyInput {
   rgba: Uint8ClampedArray;
@@ -37,7 +38,40 @@ export interface SimplifyResult {
 
 const UNSET = 255;
 
-export function simplify(inp: SimplifyInput): SimplifyResult {
+/** The expensive part, cached by the worker while only hand edits change. */
+export interface Prepared {
+  labels: Uint8Array;
+  L: Float32Array;
+  A: Float32Array;
+  B: Float32Array;
+  released: number;
+}
+
+export function simplify(inp: SimplifyInput, edits: PxEdit[] = []): SimplifyResult {
+  return finish(prepare(inp), inp, edits);
+}
+
+/** Apply hand edits to a copy of the prepared labels, re-check the size rules, measure. */
+export function finish(prep: Prepared, inp: SimplifyInput, edits: PxEdit[]): SimplifyResult {
+  const { width: w, height: h, woodLabs } = inp;
+  const k = woodLabs.length;
+  const labels = prep.labels.slice();
+  let released = prep.released;
+  if (edits.length) {
+    applyEdits(labels, w, h, k, edits);
+    // Edits obey the same rules: no lines thinner, no islands smaller than allowed.
+    released += removeThin(labels, w, h, k, (inp.minFeatureMm / 2) * inp.pxPerMm, prep.L, prep.A, prep.B, woodLabs, inp.colorWeight);
+    released += removeSmallIslands(labels, w, h, k, inp.minAreaMm2 * inp.pxPerMm * inp.pxPerMm);
+  }
+  return {
+    labels,
+    stats: computeStats(labels, w, h, k, inp.pxPerMm),
+    adjacency: computeAdjacency(labels, w, h, k),
+    releasedPct: (100 * released) / (w * h),
+  };
+}
+
+export function prepare(inp: SimplifyInput): Prepared {
   const { width: w, height: h, woodLabs } = inp;
   const n = w * h;
   const k = woodLabs.length;
@@ -105,12 +139,7 @@ export function simplify(inp: SimplifyInput): SimplifyResult {
   // by the wood it touches most.
   released += removeSmallIslands(labels, w, h, k, inp.minAreaMm2 * inp.pxPerMm * inp.pxPerMm);
 
-  return {
-    labels,
-    stats: computeStats(labels, w, h, k, inp.pxPerMm),
-    adjacency: computeAdjacency(labels, w, h, k),
-    releasedPct: (100 * released) / n,
-  };
+  return { labels, L, A, B, released };
 }
 
 function removeThin(labels: Uint8Array, w: number, h: number, k: number, radiusPx: number,
