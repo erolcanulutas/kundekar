@@ -2,6 +2,9 @@
 // is autosaved to IndexedDB and can be exported to / imported from a file.
 
 import type { Edit } from "./core/edits";
+
+/** A lasso on the image (u,v pairs in 0..1 of the image) that keeps or cuts part of the mask. */
+export interface MaskFix { mode: "keep" | "cut"; pts: number[] }
 import { DEFAULT_SETTINGS, type MachineSettings } from "./core/machine";
 import { newUid, WOOD_KITS, woodsFromKit, type Wood } from "./core/woods";
 
@@ -19,6 +22,7 @@ export interface Project {
   imageName: string | null;
   mask: Blob | null; // AI subject mask (alpha = keep), same size as the image
   maskOn: boolean;
+  maskFixes: MaskFix[]; // hand corrections to the AI mask, applied in order
   edits: Edit[];
   step: string; // id of the step the user is on
   done: Record<string, number>; // step id -> time it was marked done
@@ -30,7 +34,7 @@ export function newProject(name = "Untitled inlay"): Project {
   const now = Date.now();
   return {
     id: newUid(), name, created: now, updated: now, base, tones,
-    settings: { ...DEFAULT_SETTINGS }, image: null, imageName: null, mask: null, maskOn: false, edits: [],
+    settings: { ...DEFAULT_SETTINGS }, image: null, imageName: null, mask: null, maskOn: false, maskFixes: [], edits: [],
     step: "image", done: {}, log: [{ t: now, text: "Project created" }],
   };
 }
@@ -109,6 +113,7 @@ export async function importProject(f: File): Promise<Project> {
     mask,
     maskOn: !!(mask && rest.maskOn),
     edits: rest.edits ?? [],
+    maskFixes: rest.maskFixes ?? [],
     settings: { ...DEFAULT_SETTINGS, ...rest.settings },
     image,
     id: newUid(), // never overwrite an existing project silently

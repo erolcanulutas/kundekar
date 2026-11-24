@@ -48,6 +48,12 @@ let activeWood = ""; // uid
 let brushMm = 3;
 let redo: Edit[] = [];
 let spaceHeld = false;
+let maskTool: "keep" | "cut" | null = null; // image step: fixing the AI mask
+
+/** Is a drawing tool active on the stage (so the left button draws instead of panning)? */
+function toolActive(): boolean {
+  return P.step === "refine" || (P.step === "image" && !!maskTool && P.maskOn);
+}
 
 const CAL_KEY = "kundekar.cssPxPerMm";
 let cssPxPerMm = Number(localStorage.getItem(CAL_KEY)) || 96 / 25.4;
@@ -205,6 +211,8 @@ async function loadProject(p: Project) {
   P.edits ??= [];
   P.mask ??= null;
   P.maskOn ??= false;
+  P.maskFixes ??= [];
+  maskTool = null;
   redo = [];
   result = null;
   work = null;
@@ -255,8 +263,20 @@ function prepareWork() {
   ctx.drawImage(bitmap, g.draw.x * sx, g.draw.y * sy, g.draw.w * sx, g.draw.h * sy);
   if (P.maskOn && maskBitmap) {
     // Background removed: keep the subject; the rest turns transparent = base wood.
+    const dw = Math.max(1, Math.round(g.draw.w * sx)), dh = Math.max(1, Math.round(g.draw.h * sy));
+    const mc = new OffscreenCanvas(dw, dh);
+    const m = mc.getContext("2d")!;
+    m.drawImage(maskBitmap, 0, 0, dw, dh);
+    for (const f of P.maskFixes) {
+      m.beginPath();
+      for (let i = 0; i < f.pts.length; i += 2) m.lineTo(f.pts[i] * dw, f.pts[i + 1] * dh);
+      m.closePath();
+      m.globalCompositeOperation = f.mode === "keep" ? "source-over" : "destination-out";
+      m.fillStyle = "#fff";
+      m.fill();
+    }
     ctx.globalCompositeOperation = "destination-in";
-    ctx.drawImage(maskBitmap, g.draw.x * sx, g.draw.y * sy, g.draw.w * sx, g.draw.h * sy);
+    ctx.drawImage(mc, g.draw.x * sx, g.draw.y * sy, g.draw.w * sx, g.draw.h * sy);
     ctx.globalCompositeOperation = "source-over";
   }
   ctx.restore();
@@ -496,7 +516,15 @@ function renderImage(): string {
     ${P.image ? `<div class="sec"><h3>Background <span>AI · runs in your browser</span></h3>
       ${P.mask
         ? `<label class="check"><input type="checkbox" data-act="maskOn" ${P.maskOn ? "checked" : ""} /> Remove background (keep the subject only)</label>
-           <p style="margin:6px 0 0"><button class="btn small ghost danger" data-act="dropMask">Discard the mask</button></p>`
+           ${P.maskOn ? `<div class="field" style="margin:12px 0 0"><label>Fix the mask</label>
+             <span class="seg" role="group" aria-label="Fix the mask">
+               <button data-masktool="keep" aria-pressed="${maskTool === "keep"}">+ Keep area</button><button data-masktool="cut" aria-pressed="${maskTool === "cut"}">− Cut area</button></span>
+             <span class="hint">${maskTool
+               ? `Draw around the area on the preview. <b>${maskTool === "keep" ? "Keep" : "Cut"}</b> stays selected for more; click it again when done. Hold <kbd>Space</kbd> to pan.`
+               : "The AI missed a part (a shoulder, a hand)? Choose <b>Keep area</b> and draw around it. Left something it shouldn't? Use <b>Cut area</b>."}</span></div>` : ""}
+           <p style="margin:8px 0 0;display:flex;gap:6px;flex-wrap:wrap">
+             ${P.maskFixes.length ? `<button class="btn small" data-act="undoMaskFix">↶ Undo last fix (${P.maskFixes.length})</button>` : ""}
+             <button class="btn small ghost danger" data-act="dropMask">Discard the mask</button></p>`
         : `<button class="btn small" data-act="removeBg" ${aiStatus ? "disabled" : ""}>✦ Remove background</button>`}
       <p class="hint" data-live="aiStatus">${aiStatus ? esc(aiStatus) : "Finds the person (or main subject); everything else becomes base wood. Works best on people and clear subjects. The first use downloads a ~45 MB model; your image is never uploaded."}</p>
     </div>` : ""}
@@ -611,7 +639,13 @@ function pushEdit(e: Edit) {
   if (P.step === "refine") renderPanel();
 }
 
+function undoMaskFix() {
+  if (!P.maskFixes.pop()) return;
+  sizeChanged(P.step === "image");
+}
+
 function undoEdit() {
+  if (P.step === "image") { undoMaskFix(); return; }
   const e = P.edits.pop();
   if (!e) return;
   redo.push(e);
@@ -826,7 +860,7 @@ function toCustom() {
 function positionPlacer() {
   const placer = $(".placer"), artbox = $(".artbox");
   const g = placement();
-  const show = !!(g && work && P.step === "image" && view === "original");
+  const show = !!(g && work && P.step === "image" && view === "original" && !maskTool);
   if (artbox) artbox.style.display = show && P.settings.marginMm > 0 ? "block" : "none";
   if (placer) placer.style.display = show && P.settings.sizeMode === "board" ? "block" : "none";
   if (!show || !g) return;
@@ -1026,7 +1060,7 @@ function bindStageScroll() {
   scroll.addEventListener("pointerdown", (e) => {
     if (!work || (e.button !== 0 && e.button !== 1)) return;
     if (!(e.target as Element).closest(".stage-grid")) return; // leave the scrollbars alone
-    if (P.step === "refine" && e.button === 0 && !spaceHeld) return; // the refine tools own the left button
+    if (toolActive() && e.button === 0 && !spaceHeld) return; // the drawing tools own the left button
     drag = { x: e.clientX, y: e.clientY, sl: scroll.scrollLeft, st: scroll.scrollTop, id: e.pointerId };
     scroll.setPointerCapture(e.pointerId);
     scroll.classList.add("panning");
@@ -1052,8 +1086,8 @@ function clearInk() {
 
 function updateToolCursor() {
   const scroll = $(".stage-scroll");
-  scroll?.classList.toggle("toolmode", P.step === "refine" && !spaceHeld);
-  scroll?.classList.toggle("spacepan", P.step === "refine" && spaceHeld);
+  scroll?.classList.toggle("toolmode", toolActive() && !spaceHeld);
+  scroll?.classList.toggle("spacepan", toolActive() && spaceHeld);
   if (P.step !== "refine" || tool !== "brush") $(".ink .cursor")?.setAttribute("r", "0");
 }
 
@@ -1074,7 +1108,11 @@ function bindTools(scroll: HTMLElement) {
     const p = stroke.pts;
     let d = `M${p[0]} ${p[1]}`;
     for (let i = 2; i < p.length; i += 2) d += `L${p[i]} ${p[i + 1]}`;
-    if (tool === "brush") {
+    if (P.step === "image") {
+      d += "Z";
+      const keep = maskTool === "keep";
+      Object.assign(path.style, { stroke: keep ? "#1c6b66" : "#a8402a", strokeWidth: "", fill: keep ? "#8fd0c6" : "#f1d9cf", strokeDasharray: "4 3", opacity: "0.55" });
+    } else if (tool === "brush") {
       if (p.length === 2) d += `L${p[0] + 0.01} ${p[1]}`;
       Object.assign(path.style, { stroke: woodColor(), strokeWidth: `${brushMm * 2}`, fill: "none", strokeDasharray: "", opacity: "0.85" });
     } else {
@@ -1084,11 +1122,13 @@ function bindTools(scroll: HTMLElement) {
     path.setAttribute("d", d);
   };
   scroll.addEventListener("pointerdown", (e) => {
-    if (P.step !== "refine" || e.button !== 0 || spaceHeld || !work || !result || !bitmap) return;
+    if (!toolActive() || e.button !== 0 || spaceHeld || !work || !bitmap) return;
+    if (P.step === "refine" && !result) return;
     if (!(e.target as Element).closest(".viewbox")) return;
     e.preventDefault();
     const [x, y] = toMm(e);
     const [u, v] = toUv(x, y);
+    if (P.step === "image") { stroke = { pts: [x, y], id: e.pointerId }; scroll.setPointerCapture(e.pointerId); drawStroke(); return; }
     if (tool === "fill") { pushEdit({ t: "fill", u, v, wood: activeWood }); return; }
     if (tool === "merge") { pushEdit({ t: "merge", u, v }); return; }
     stroke = { pts: [x, y], id: e.pointerId };
@@ -1096,10 +1136,10 @@ function bindTools(scroll: HTMLElement) {
     drawStroke();
   });
   scroll.addEventListener("pointermove", (e) => {
-    if (P.step !== "refine" || !work) return;
+    if (!toolActive() || !work) return;
     const [x, y] = toMm(e);
     const cur = $(".ink .cursor");
-    if (cur && tool === "brush" && !spaceHeld) {
+    if (cur && P.step === "refine" && tool === "brush" && !spaceHeld) {
       cur.setAttribute("cx", String(x)); cur.setAttribute("cy", String(y)); cur.setAttribute("r", String(brushMm));
     }
     if (!stroke || e.pointerId !== stroke.id) return;
@@ -1113,6 +1153,11 @@ function bindTools(scroll: HTMLElement) {
     const uv: number[] = [];
     for (let i = 0; i < stroke.pts.length; i += 2) uv.push(...toUv(stroke.pts[i], stroke.pts[i + 1]));
     const g = placement()!;
+    stroke = null;
+    if (P.step === "image") {
+      if (uv.length >= 6 && maskTool) { P.maskFixes.push({ mode: maskTool, pts: uv }); sizeChanged(true); } else clearInk();
+      return;
+    }
     if (tool === "brush") pushEdit({ t: "brush", pts: uv, r: brushMm / g.draw.w, wood: activeWood });
     else if (uv.length >= 6) pushEdit({ t: "lasso", pts: uv, wood: activeWood });
     else clearInk();
@@ -1313,6 +1358,8 @@ function bindPanel() {
 
   panel.onclick = (e) => {
     const t = e.target as HTMLElement;
+    const mt = t.closest<HTMLElement>("[data-masktool]")?.dataset.masktool as "keep" | "cut" | undefined;
+    if (mt) { maskTool = maskTool === mt ? null : mt; view = "original"; renderPanel(); renderStage(); return; }
     const tl = t.closest<HTMLElement>("[data-tool]")?.dataset.tool as Tool | undefined;
     if (tl) { tool = tl; renderPanel(); updateToolCursor(); return; }
     const pick = t.closest<HTMLElement>("[data-pick-wood]")?.dataset.pickWood;
@@ -1354,6 +1401,7 @@ function bindPanel() {
     if (!act) return;
     if (act === "pick") { $<HTMLInputElement>("#imageFile")?.click(); return; }
     if (act === "undo") { undoEdit(); return; }
+    if (act === "undoMaskFix") { undoMaskFix(); return; }
     if (act === "redo") { redoEdit(); return; }
     if (act === "clearEdits") {
       const btn = t.closest<HTMLButtonElement>("[data-act]")!;
@@ -1500,6 +1548,7 @@ const reprepare = debounce(() => {
   prepareWork();
   result = null;
   renderStage();
+  clearInk();
   refreshLive();
   scheduleProcess(0);
 }, 250);
@@ -1563,7 +1612,7 @@ window.addEventListener("resize", debounce(layoutStage, 100));
 const typing = (t: EventTarget | null) => t instanceof HTMLElement && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName));
 window.addEventListener("keydown", (e) => {
   if (typing(e.target)) return;
-  if (e.code === "Space" && P?.step === "refine" && !spaceHeld) { spaceHeld = true; updateToolCursor(); e.preventDefault(); }
+  if (e.code === "Space" && P && toolActive() && !spaceHeld) { spaceHeld = true; updateToolCursor(); e.preventDefault(); }
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && !e.shiftKey) { e.preventDefault(); undoEdit(); }
   if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === "y" || (e.key.toLowerCase() === "z" && e.shiftKey))) { e.preventDefault(); redoEdit(); }
 });
