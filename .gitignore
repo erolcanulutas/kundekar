@@ -34,3 +34,5 @@ htmlcov/
 # Local test images / scratch
 scratch/
 *.log
+
+node_modules/

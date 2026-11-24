@@ -76,6 +76,8 @@ Rules:
 
 ## 4. Image processing pipeline
 
+Implemented in `src/core/simplify.ts` (steps 1–3 and a colour-level version of 5).
+
 1. Load the image and resize it to the physical size and a working resolution.
 2. Quantize the colors **to the actual wood colors**, e.g. nearest color in Lab space or
    k-means followed by mapping. Optional manual mapping and editing.
@@ -122,16 +124,21 @@ Rules:
 
 ## 8. Roadmap
 
-1. **Repo setup:** README and `.gitignore` (Python). The tech stack is likely Python
-   with OpenCV, scikit-image, shapely, and potrace or an equivalent.
-2. **MVP 1:** image → wood-color simplification → minimum-feature cleanup → real-scale
-   preview. This is the fastest test of whether the project works.
+1. **Repo setup:** done. Stack decided (2026-11-24): **TypeScript + Vite**, a static
+   web app on GitHub Pages (https://erolcanulutas.github.io/kundekar/). Python was
+   dropped because Pages cannot run it. The DOM-free core in `src/core/` can later run
+   in Node for a downloadable version.
+2. **MVP 1:** done. Wood stock with presets and thickness, image → wood-color
+   simplification → minimum-feature cleanup → real-scale preview. Step-by-step UI with
+   Back/Next. Projects are autosaved in IndexedDB and can be exported/imported as files,
+   because one project spans days of glue curing.
 3. **MVP 2:** round planning (adjacency and ordering) and an SVG/DXF export of the
    pocket and plug for each round. Cut these in existing CAM first to validate the
    process.
 4. **MVP 3:** native G-code generation: clearing, V-carve, plug, surfacing,
    registration holes. Generic post-processor.
-5. Extras: engraving lines, 2.5D, UI polish.
+5. Downloadable/offline version reusing the same core.
+6. Extras: engraving lines, 2.5D, UI polish.
 
 ## 9. Security note
 

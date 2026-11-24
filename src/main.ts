@@ -1,0 +1,949 @@
+import "./style.css";
+import { derive, fmt, pxPerMm, SIZE_PRESETS, V_ANGLES, type Derived } from "./core/machine";
+import { paintSwatch, seedFor } from "./core/grain";
+import { planRounds, type SimplifyResult } from "./core/simplify";
+import {
+  MAX_TONES, presetById, TONE_THICKNESS, WOOD_KITS, WOOD_PRESETS, woodFromPreset, woodsFromKit, type Wood,
+} from "./core/woods";
+import {
+  exportProject, fileName, importProject, lastProjectId, newProject, store, type Project,
+} from "./project";
+import ProcessWorker from "./worker?worker";
+import type { JobRequest, JobResponse } from "./worker";
+
+// ---------------------------------------------------------------- state
+
+type View = "original" | "woods" | "inlay";
+type Zoom = "fit" | "real";
+
+interface Work { w: number; h: number; ppm: number; wMm: number; hMm: number; rgba: ImageData }
+interface Result { res: SimplifyResult; flat: ImageData; inlay: ImageData; ms: number }
+
+let P: Project;
+let bitmap: ImageBitmap | null = null;
+let bitmapOf: Blob | null = null;
+let imageUrl: string | null = null;
+let work: Work | null = null;
+let result: Result | null = null;
+let view: View = "inlay";
+let zoom: Zoom = "fit";
+let busy = false;
+let pending = false;
+let jobId = 0;
+
+const CAL_KEY = "kundekar.cssPxPerMm";
+let cssPxPerMm = Number(localStorage.getItem(CAL_KEY)) || 96 / 25.4;
+
+const worker = new ProcessWorker();
+
+// ---------------------------------------------------------------- helpers
+
+const $ = <T extends Element = HTMLElement>(sel: string, root: ParentNode = document) => root.querySelector<T>(sel);
+const $$ = <T extends Element = HTMLElement>(sel: string, root: ParentNode = document) => [...root.querySelectorAll<T>(sel)];
+
+function esc(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
+}
+
+function clamp(v: number, lo: number, hi: number): number {
+  return Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : lo;
+}
+
+function toast(msg: string) {
+  const t = document.createElement("div");
+  t.className = "toast";
+  t.textContent = msg;
+  document.body.append(t);
+  setTimeout(() => t.remove(), 2600);
+}
+
+function download(blob: Blob, name: string) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+function allWoods(): Wood[] {
+  return [P.base, ...P.tones];
+}
+
+function debounce<A extends unknown[]>(fn: (...a: A) => void, ms: number) {
+  let t: number | undefined;
+  return (...a: A) => { clearTimeout(t); t = window.setTimeout(() => fn(...a), ms); };
+}
+
+const STAR = `<svg viewBox="-12 -12 24 24" aria-hidden="true"><g stroke="currentColor" stroke-width=".9" stroke-linejoin="round">
+  <rect x="-7.5" y="-7.5" width="15" height="15" fill="#e6d2a8"/><rect x="-7.5" y="-7.5" width="15" height="15" fill="#e6d2a8" transform="rotate(45)"/>
+  <polygon points="0,-4.6 3.25,-3.25 4.6,0 3.25,3.25 0,4.6 -3.25,3.25 -4.6,0 -3.25,-3.25" fill="#5b3e2a"/></g></svg>`;
+
+// ---------------------------------------------------------------- steps
+
+interface Step {
+  id: string;
+  title: string;
+  sub: string;
+  phase: string;
+  view: View;
+  /** null = may continue; otherwise the reason it can't yet. */
+  blocker: () => string | null;
+  render: () => string;
+}
+
+const STEPS: Step[] = [
+  { id: "stock", title: "Wood stock", sub: "Base + tone boards", phase: "Setup", view: "inlay", blocker: () => null, render: renderStock },
+  {
+    id: "image", title: "Image & size", sub: "Artwork, finished size", phase: "Setup", view: "original",
+    blocker: () => (P.image ? null : "Add an image to continue."), render: renderImage,
+  },
+  { id: "machine", title: "Bit & depths", sub: "V-bit, pocket, surfacing", phase: "Setup", view: "inlay", blocker: () => null, render: renderMachine },
+  {
+    id: "simplify", title: "Simplify", sub: "Wood regions", phase: "Setup", view: "inlay",
+    blocker: () => "Round planning and G-code are the next milestones. Your setup is saved until then.",
+    render: renderSimplify,
+  },
+  {
+    id: "rounds", title: "Rounds", sub: "Pocket · plug · glue · surface", phase: "Workshop", view: "inlay",
+    blocker: () => "Not built yet.", render: () => "",
+  },
+];
+
+function stepIndex(id = P.step) {
+  return Math.max(0, STEPS.findIndex((s) => s.id === id));
+}
+
+/** A step can be opened when every step before it can be left. */
+function reachable(i: number): boolean {
+  if (STEPS[i].id === "rounds") return false;
+  for (let j = 0; j < i; j++) if (STEPS[j].blocker() && STEPS[j].id !== "simplify") return false;
+  return true;
+}
+
+function goTo(id: string) {
+  P.step = id;
+  view = STEPS[stepIndex()].view;
+  if (!result && view !== "original") view = "original";
+  touch(false);
+  renderAll();
+  $(".panel")!.scrollTop = 0;
+}
+
+function next() {
+  const i = stepIndex();
+  if (STEPS[i].blocker()) return;
+  if (!P.done[STEPS[i].id]) {
+    P.done[STEPS[i].id] = Date.now();
+    P.log.push({ t: Date.now(), text: `${STEPS[i].title} done` });
+  }
+  goTo(STEPS[i + 1].id);
+}
+
+// ---------------------------------------------------------------- persistence
+
+let saveTimer: number | undefined;
+function touch(reprocess: boolean) {
+  P.updated = Date.now();
+  $(".saved")?.classList.add("dirty");
+  const s = $(".saved");
+  if (s) s.textContent = "Saving…";
+  clearTimeout(saveTimer);
+  saveTimer = window.setTimeout(save, 400);
+  if (reprocess) scheduleProcess();
+}
+
+async function save() {
+  await store.put(P);
+  lastProjectId.set(P.id);
+  const s = $(".saved");
+  if (s) {
+    s.classList.remove("dirty");
+    s.textContent = "Saved " + new Date(P.updated).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+}
+
+async function loadProject(p: Project) {
+  P = p;
+  result = null;
+  work = null;
+  lastProjectId.set(p.id);
+  await prepareImage();
+  view = STEPS[stepIndex()].view;
+  if (!work) view = "original";
+  renderAll();
+  scheduleProcess(0);
+}
+
+// ---------------------------------------------------------------- image + processing
+
+async function prepareImage() {
+  if (!P.image) {
+    bitmap = null; bitmapOf = null; work = null;
+    if (imageUrl) URL.revokeObjectURL(imageUrl);
+    imageUrl = null;
+    return;
+  }
+  if (bitmapOf !== P.image) {
+    bitmap = await createImageBitmap(P.image);
+    bitmapOf = P.image;
+    if (imageUrl) URL.revokeObjectURL(imageUrl);
+    imageUrl = URL.createObjectURL(P.image);
+  }
+  prepareWork();
+}
+
+function prepareWork() {
+  if (!bitmap) { work = null; return; }
+  const wMm = P.settings.widthMm;
+  const hMm = (wMm * bitmap.height) / bitmap.width;
+  const ppm = pxPerMm(wMm, hMm);
+  const w = Math.max(8, Math.round(wMm * ppm)), h = Math.max(8, Math.round(hMm * ppm));
+  const c = new OffscreenCanvas(w, h);
+  const ctx = c.getContext("2d")!;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(bitmap, 0, 0, w, h);
+  work = { w, h, ppm: w / wMm, wMm, hMm, rgba: ctx.getImageData(0, 0, w, h) };
+}
+
+let processTimer: number | undefined;
+function scheduleProcess(delay = 300) {
+  clearTimeout(processTimer);
+  processTimer = window.setTimeout(runJob, delay);
+}
+
+function runJob() {
+  if (!work) { result = null; renderStage(); refreshLive(); return; }
+  if (busy) { pending = true; return; }
+  busy = true;
+  pending = false;
+  const d = derive(P.settings, P.base, P.tones);
+  const req: JobRequest = {
+    id: ++jobId,
+    rgba: work.rgba.data.slice(),
+    width: work.w,
+    height: work.h,
+    pxPerMm: work.ppm,
+    woods: allWoods().map((w) => ({ color: w.color, figure: w.figure, seed: seedFor(w.uid) })),
+    minFeatureMm: d.minFeature,
+    colorWeight: P.settings.colorWeight,
+  };
+  worker.postMessage(req, [req.rgba.buffer]);
+  updateStatus();
+}
+
+worker.onmessage = (e: MessageEvent<JobResponse>) => {
+  const r = e.data;
+  busy = false;
+  if (r.error) {
+    toast("Processing failed: " + r.error);
+  } else if (r.id === jobId && work && r.result && r.flat && r.inlay) {
+    const firstResult = !result;
+    result = {
+      res: r.result,
+      flat: new ImageData(r.flat as Uint8ClampedArray<ArrayBuffer>, work.w, work.h),
+      inlay: new ImageData(r.inlay as Uint8ClampedArray<ArrayBuffer>, work.w, work.h),
+      ms: r.ms ?? 0,
+    };
+    if (firstResult && P.step !== "image") view = STEPS[stepIndex()].view;
+    renderStage();
+    refreshLive();
+  }
+  if (pending) runJob();
+  else updateStatus();
+};
+
+async function setImage(file: Blob, name: string) {
+  if (!file.type.startsWith("image/")) { toast("That file is not an image."); return; }
+  P.image = file;
+  P.imageName = name;
+  P.log.push({ t: Date.now(), text: `Image: ${name}` });
+  result = null;
+  try {
+    await prepareImage();
+  } catch {
+    P.image = null; P.imageName = null;
+    await prepareImage();
+    toast("Could not read that image.");
+  }
+  view = "original";
+  touch(true);
+  renderAll();
+}
+
+// ---------------------------------------------------------------- shell
+
+function renderAll() {
+  app.innerHTML = `
+    <header class="mast">
+      <a class="brand" href="./" aria-label="Kündekâr home">${STAR}<div><h1>Kündekâr</h1><small>V-carve inlay workshop</small></div></a>
+      <div class="proj">
+        <label class="sr" for="pname">Project name</label>
+        <input id="pname" type="text" value="${esc(P.name)}" maxlength="80" />
+        <span class="saved">Saved</span>
+      </div>
+      <div class="mast-actions">
+        <button class="btn ghost small" data-act="projects">Projects</button>
+        <button class="btn ghost small" data-act="export" title="Download this project as a file">Export</button>
+        <button class="btn ghost small" data-act="import" title="Open a project file">Import</button>
+        <input type="file" id="importFile" accept=".json,application/json" hidden />
+      </div>
+    </header>
+    <nav class="rail" aria-label="Steps"></nav>
+    <main class="bench">
+      <section class="panel" aria-live="polite"></section>
+      <section class="stage" aria-label="Preview"></section>
+    </main>
+    <footer class="foot"></footer>`;
+  renderRail();
+  renderPanel();
+  renderStageShell();
+  renderFoot();
+  bindShell();
+}
+
+function renderRail() {
+  let html = "", phase = "";
+  STEPS.forEach((s, i) => {
+    if (s.phase !== phase) { phase = s.phase; html += `<div class="phase">${phase}</div>`; }
+    const cur = s.id === P.step ? ` aria-current="step"` : "";
+    const done = P.done[s.id] ? " done" : "";
+    const dis = reachable(i) ? "" : " disabled";
+    const num = P.done[s.id] && s.id !== P.step ? "✓" : String(i + 1).padStart(2, "0");
+    html += `<button class="${done}" data-goto="${s.id}"${cur}${dis}><span class="num">${num}</span><span class="t">${s.title}</span><span class="s">${s.sub}</span></button>`;
+  });
+  $(".rail")!.innerHTML = html;
+}
+
+function renderFoot() {
+  const i = stepIndex();
+  const blocker = STEPS[i].blocker();
+  $(".foot")!.innerHTML = `
+    <button class="btn" data-act="back" ${i === 0 ? "disabled" : ""}>← Back</button>
+    <span class="where">Step ${i + 1} of ${STEPS.length}</span>
+    <span class="why">${blocker ? esc(blocker) : ""}</span>
+    <button class="btn primary" data-act="next" ${blocker ? "disabled" : ""}>Next: ${STEPS[i + 1]?.title ?? ""} →</button>`;
+}
+
+function renderPanel() {
+  const step = STEPS[stepIndex()];
+  $(".panel")!.innerHTML = step.render();
+  bindPanel();
+  refreshLive();
+}
+
+function head(i: number, title: string, text: string) {
+  return `<div class="panel-head"><div class="kicker">Step ${String(i).padStart(2, "0")} · ${STEPS[i - 1].phase}</div><h2>${title}</h2><p>${text}</p></div>`;
+}
+
+// ---------------------------------------------------------------- step panels
+
+function presetOptions(w: Wood): string {
+  const opts = WOOD_PRESETS.map((p) => `<option value="${p.id}" ${p.id === w.presetId ? "selected" : ""}>${p.name}</option>`).join("");
+  return `${opts}<option value="" ${w.presetId ? "" : "selected"}>Custom wood…</option>`;
+}
+
+function woodCard(w: Wood, idx: number, isBase: boolean): string {
+  const preset = presetById(w.presetId);
+  return `<li class="wood ${isBase ? "base" : ""}" data-uid="${w.uid}">
+    <div class="end"><canvas width="44" height="120" data-swatch="${w.uid}"></canvas><span class="idx">${isBase ? "BASE" : "T" + idx}</span></div>
+    <div class="body">
+      <div class="row"><select data-act="preset" aria-label="Species">${presetOptions(w)}</select></div>
+      ${preset
+        ? `<div class="local">${esc(preset.local)}</div>`
+        : `<div class="row"><input type="text" data-act="name" value="${esc(w.name)}" aria-label="Wood name" maxlength="40" /></div>`}
+      <div class="row">
+        <input type="color" data-act="color" value="${w.color}" aria-label="Color of your board" title="Color of your board" />
+        <label class="thick"><input type="number" data-act="thick" min="1" max="40" step="0.5" value="${w.thickness}" aria-label="Thickness" /><span class="unit">mm</span></label>
+        <span class="profile" title="Edge view, to scale"><i style="height:${clamp(w.thickness * 1.6, 2, 22)}px;background:${w.color}"></i></span>
+        <span class="acts">${isBase ? "" : `
+          <button class="btn ghost small" data-act="mkbase" title="Use as base board">⇅ base</button>
+          <button class="btn ghost small danger" data-act="remove" title="Remove" aria-label="Remove ${esc(w.name)}">✕</button>`}</span>
+      </div>
+    </div></li>`;
+}
+
+function renderStock(): string {
+  const kits = WOOD_KITS.map((k) => {
+    const bars = [k.base, ...k.tones].map((id) => `<i style="background:${presetById(id)!.color}"></i>`).join("");
+    return `<button class="kit" data-kit="${k.id}" title="${esc(k.description)}"><span class="bars">${bars}</span><b>${k.name}</b></button>`;
+  }).join("");
+  return `${head(1, "Wood stock", "Choose the boards you really have. The base is the ~10 mm board everything is inlaid into; tone woods are the thinner boards the plugs are cut from. Set each color to match your actual board.")}
+    <div class="sec"><h3>Start from a kit <span>replaces the list</span></h3><div class="kits">${kits}</div></div>
+    <div class="sec"><h3>Your boards <span>${1 + P.tones.length} colors</span></h3>
+      <div class="tag-label"><span>Base board</span></div>
+      <ul class="woods">${woodCard(P.base, 0, true)}</ul>
+      <div class="tag-label"><span>Tone woods</span><span>${P.tones.length} / ${MAX_TONES}</span></div>
+      <ul class="woods">${P.tones.map((t, i) => woodCard(t, i + 1, false)).join("")}</ul>
+      <p><button class="btn small" data-act="addTone" ${P.tones.length >= MAX_TONES ? "disabled" : ""}>+ Add tone wood</button></p>
+    </div>
+    <div class="sec" data-live="warns"></div>`;
+}
+
+function renderImage(): string {
+  const s = P.settings;
+  const img = P.image && bitmap
+    ? `<div class="imgmeta"><img src="${imageUrl}" alt="" /><div><b>${esc(P.imageName ?? "Image")}</b>
+         <div class="muted mono">${bitmap.width} × ${bitmap.height} px</div>
+         <p style="margin:6px 0 0"><button class="btn small" data-act="pick">Replace</button>
+         <button class="btn small ghost danger" data-act="clearImage">Remove</button></p></div></div>`
+    : `<div class="drop" data-act="pick" tabindex="0" role="button"><b>Drop an image here</b>
+         <span class="muted">or click to choose · or paste with Ctrl+V<br/>PNG, JPG, WebP · transparent areas become base wood</span></div>`;
+  const chips = SIZE_PRESETS.map((p) => `<button class="chip" data-width="${p.widthMm}" aria-pressed="${p.widthMm === s.widthMm}">${p.label} · ${p.widthMm}</button>`).join("");
+  return `${head(2, "Image & size", "Detailed artwork is welcome: it will be reduced to your woods in step 4. The piece keeps the image's proportions.")}
+    <div class="sec"><h3>Artwork</h3>${img}<input type="file" id="imageFile" accept="image/*" hidden /></div>
+    <div class="sec"><h3>Finished size</h3>
+      <div class="chips" style="margin-bottom:12px">${chips}</div>
+      <div class="field"><label for="widthMm">Width</label><span><input id="widthMm" type="number" min="20" max="2000" step="1" value="${s.widthMm}" data-set="widthMm" /><span class="unit">mm</span></span></div>
+      <dl class="readout" data-live="size"></dl>
+    </div>`;
+}
+
+function numField(key: keyof Project["settings"], label: string, hint: string, min: number, max: number, step: number) {
+  return `<div class="field"><label for="f-${key}">${label}</label>
+    <span><input id="f-${key}" type="number" min="${min}" max="${max}" step="${step}" value="${P.settings[key]}" data-set="${key}" /><span class="unit">mm</span></span>
+    <span class="hint">${hint}</span></div>`;
+}
+
+function renderMachine(): string {
+  const s = P.settings;
+  const angles = V_ANGLES.map((a) => `<button data-angle="${a}" aria-pressed="${a === s.vAngle}">${a}°</button>`).join("");
+  return `${head(3, "Bit & depths", "These numbers decide how fine the inlay can be. A V-bit cuts narrower where it cuts shallower, and every surfacing pass shaves earlier inlays thinner.")}
+    <div class="sec"><h3>V-bit angle</h3>
+      <div class="field"><span class="seg" role="group" aria-label="V-bit angle">${angles}</span>
+      <span><input type="number" min="10" max="150" step="1" value="${s.vAngle}" data-set="vAngle" aria-label="Custom angle" /><span class="unit">°</span></span>
+      <span class="hint">90° is the default for inlays; 60° holds finer detail but needs more passes.</span></div>
+    </div>
+    <div class="sec"><h3>Depths</h3>
+      ${numField("pocketDepth", "Pocket depth", "How deep pockets are cut into the base.", 0.5, 6, 0.1)}
+      ${numField("glueGap", "Glue gap", "Plugs are cut this much deeper so they bottom out on the walls, not the floor.", 0, 2, 0.1)}
+      ${numField("surfacePerRound", "Surfacing per round", "Removed from the base each time you flatten after gluing.", 0.02, 1, 0.01)}
+      ${numField("minRetained", "Thinnest edge kept", "The shallowest inlay edge worth keeping after all surfacing.", 0.1, 3, 0.1)}
+    </div>
+    <div class="sec"><h3>Cross-section <span>to scale, top of the base board</span></h3><div data-live="section"></div></div>
+    <div class="sec"><h3>What this means</h3><dl class="readout" data-live="derived"></dl></div>
+    <div class="sec" data-live="warns"></div>`;
+}
+
+function renderSimplify(): string {
+  const s = P.settings;
+  return `${head(4, "Simplify", "The image is reduced to your woods. Regions too narrow for the bit to hold are merged into the neighbour closest in color.")}
+    <div class="sec"><h3>Controls</h3>
+      <div class="field range"><label for="r-simplify">Simplification</label><output class="mono" data-live="simplifyOut"></output>
+        <input id="r-simplify" type="range" min="1" max="4" step="0.1" value="${s.simplify}" data-set="simplify" />
+        <span class="hint">× the narrowest feature your bit can hold. Higher = bolder shapes, fewer tiny islands.</span></div>
+      <div class="field range"><label for="r-color">Match by</label><output class="mono" data-live="colorOut"></output>
+        <input id="r-color" type="range" min="0" max="1.5" step="0.05" value="${s.colorWeight}" data-set="colorWeight" />
+        <span class="hint">Left: light/dark only, like an engraving. Right: hue matters more.</span></div>
+    </div>
+    <div class="sec"><h3>Wood usage</h3><div data-live="stats"></div></div>
+    <div class="sec"><h3>Round plan <span>preview</span></h3><div data-live="rounds"></div></div>
+    <div class="sec" data-live="warns"></div>`;
+}
+
+// ---------------------------------------------------------------- live readouts
+
+function refreshLive() {
+  const d = derive(P.settings, P.base, P.tones);
+  const set = (k: string, html: string) => $$(`[data-live="${k}"]`).forEach((el) => (el.innerHTML = html));
+
+  set("warns", d.warnings.length
+    ? `<ul class="warns">${d.warnings.map((w) => `<li>${esc(w)}</li>`).join("")}</ul>`
+    : `<div class="ok">Boards and depths are compatible.</div>`);
+
+  set("derived", `
+    <dt>Surfacing over ${Math.max(1, P.tones.length)} rounds (worst case)</dt><dd>${fmt(d.surfTotal)} mm</dd>
+    <dt>Depth an edge must reach</dt><dd>${fmt(d.needDepth)} mm</dd>
+    <dt>Plug depth</dt><dd>${fmt(d.plugDepth)} mm</dd>
+    <dt>Narrowest region the bit can hold</dt><dd class="big">${fmt(d.minFeatureFine, 1)} mm</dd>`);
+
+  set("section", sectionSvg(d));
+
+  if (work) {
+    set("size", `<dt>Height (from image)</dt><dd>${fmt(work.hMm, 1)} mm</dd>
+      <dt>Working resolution</dt><dd>${work.w} × ${work.h} px</dd>
+      <dt>Pixel size</dt><dd>${fmt(1 / work.ppm, 2)} mm</dd>
+      <dt>Smallest region at this size</dt><dd>${fmt(d.minFeature, 1)} mm</dd>`);
+  } else {
+    set("size", `<dt class="muted">Height follows the image once one is added.</dt><dd></dd>`);
+  }
+
+  set("simplifyOut", `× ${fmt(P.settings.simplify, 1)} → ${fmt(d.minFeature, 1)} mm`);
+  set("colorOut", P.settings.colorWeight < 0.15 ? "lightness" : P.settings.colorWeight > 0.9 ? "color" : "balanced");
+
+  const woods = allWoods();
+  if (!work) {
+    set("stats", `<p class="muted">Add an image in step 2 to see how much of each wood you need.</p>`);
+    set("rounds", "");
+  } else if (!result) {
+    set("stats", `<p class="muted busy">Reducing the image to your woods</p>`);
+    set("rounds", "");
+  } else {
+    const { stats, adjacency, releasedPct } = result.res;
+    const total = stats.reduce((a, s) => a + s.pixels, 0) || 1;
+    const rows = stats.map((s, i) => `<tr><td><span class="dot" style="background:${woods[i].color}"></span>${esc(woods[i].name)}${i === 0 ? ' <span class="muted">(base)</span>' : ""}</td>
+      <td class="n">${fmt(s.areaMm2 / 100, 1)}</td><td class="n">${fmt((100 * s.pixels) / total, 1)}%</td><td class="n">${s.islands}</td></tr>`).join("");
+    set("stats", `<table class="stats"><thead><tr><th>Wood</th><th class="n">cm²</th><th class="n">Share</th><th class="n">Islands</th></tr></thead><tbody>${rows}</tbody></table>
+      <p class="muted" style="margin:8px 0 0;font-size:12px">Cleanup moved ${fmt(releasedPct, 1)}% of the area into neighbouring woods.</p>`);
+    const rounds = planRounds(adjacency, stats);
+    const unused = stats.map((s, i) => (i > 0 && s.pixels === 0 ? woods[i].name : null)).filter(Boolean);
+    set("rounds", rounds.length
+      ? `<ol class="rounds">${rounds.map((r) => `<li>${r.map((i) => `<span><span class="dot" style="background:${woods[i].color}"></span>${esc(woods[i].name)}</span>`).join(" ")}</li>`).join("")}</ol>
+         <p class="muted" style="margin:8px 0 0;font-size:12px">Woods that never touch share a round. Largest areas go first. ${unused.length ? `Not used: ${esc(unused.join(", "))}.` : ""}</p>`
+      : `<p class="muted">Only the base wood is left. Try lower simplification.</p>`);
+  }
+  updateStatus();
+}
+
+/** To-scale V-carve cross-section of the top of the base board. */
+function sectionSvg(d: Derived): string {
+  const s = P.settings;
+  const tan = Math.tan(((s.vAngle / 2) * Math.PI) / 180);
+  const W = 22, H = 4.5;
+  const D = Math.min(s.pocketDepth, H - 0.5);
+  const wideL = 1.6, wideR = 11;
+  const vx = 15.5, half = Math.min(d.minFeatureFine / 2, 3), vd = Math.min(d.needDepth, H - 0.5);
+  const mid = (wideL + wideR) / 2;
+  const floorL = Math.min(wideL + D * tan, mid), floorR = Math.max(wideR - D * tan, mid);
+  const wideD = floorL === floorR ? (floorL - wideL) / tan : D;
+  const base = P.base.color, tone = P.tones[0]?.color ?? "#5b3e2a";
+  const brk = `L${W} ${H - 0.25} L${W - 1.5} ${H} L${W - 3} ${H - 0.3} L${W - 4.5} ${H}`;
+  const outline = `M0 0 L${wideL} 0 L${floorL} ${wideD} L${floorR} ${wideD} L${wideR} 0 L${vx - half} 0 L${vx} ${vd} L${vx + half} 0 L${W} 0 ${brk} L0 ${H} Z`;
+  const plugs = `M${wideL} 0 L${floorL} ${wideD} L${floorR} ${wideD} L${wideR} 0 Z M${vx - half} 0 L${vx} ${vd} L${vx + half} 0 Z`;
+  const st = d.surfTotal, keepBot = Math.min(st + s.minRetained, vd);
+  const mono = `font-family="IBM Plex Mono, monospace"`;
+  const ly = H + 1.3;
+  return `<svg class="section-svg" viewBox="-1.4 -2.4 ${W + 2.4} ${H + 5.2}" role="img" aria-label="Cross-section of a pocket and the narrowest V cut">
+    <defs><pattern id="hatch" width=".5" height=".5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2=".5" stroke="#a8402a" stroke-width=".09" opacity=".6"/></pattern></defs>
+    <path d="${outline}" fill="${base}" stroke="#231c15" stroke-width=".06"/>
+    <path d="${plugs}" fill="${tone}" opacity=".92"/>
+    <rect x="0" y="0" width="${W}" height="${st}" fill="url(#hatch)"/>
+    <line x1="-.4" x2="${W + .4}" y1="${st}" y2="${st}" stroke="#a8402a" stroke-width=".06" stroke-dasharray=".35 .2"/>
+    <line x1="${wideL - .6}" x2="${wideL - .6}" y1="0" y2="${wideD}" stroke="#231c15" stroke-width=".05"/>
+    <text x="${wideL - .85}" y="${wideD / 2}" text-anchor="middle" font-size=".7" ${mono} transform="rotate(-90 ${wideL - .85} ${wideD / 2})">${fmt(wideD, 1)} mm</text>
+    <text x="${mid}" y="${Math.min(wideD + 0.95, H - .25)}" text-anchor="middle" font-size=".75" ${mono}>pocket · ${s.vAngle}°</text>
+    <line x1="${vx - half}" x2="${vx + half}" y1="-.8" y2="-.8" stroke="#1c6b66" stroke-width=".07"/>
+    <line x1="${vx - half}" x2="${vx - half}" y1="-1.15" y2="-.2" stroke="#1c6b66" stroke-width=".05"/>
+    <line x1="${vx + half}" x2="${vx + half}" y1="-1.15" y2="-.2" stroke="#1c6b66" stroke-width=".05"/>
+    <text x="${vx}" y="-1.35" text-anchor="middle" font-size=".8" fill="#1c6b66" ${mono}>${fmt(d.minFeatureFine, 1)} mm narrowest</text>
+    <line x1="${vx + half + .35}" x2="${vx + half + .35}" y1="${st}" y2="${keepBot}" stroke="#231c15" stroke-width=".05"/>
+    <text x="${vx + half + .6}" y="${(st + keepBot) / 2 + .25}" font-size=".7" ${mono}>${fmt(s.minRetained, 1)} kept</text>
+    <rect x="0" y="${ly - .55}" width="1.4" height=".7" fill="url(#hatch)" stroke="#a8402a" stroke-width=".04"/>
+    <text x="1.9" y="${ly}" font-size=".72" fill="#4a3f33" ${mono}>surfaced away over ${Math.max(1, P.tones.length)} rounds: ${fmt(st)} mm</text>
+    <rect x="0" y="${ly + .55}" width="1.4" height=".7" fill="${tone}" stroke="#231c15" stroke-width=".04"/>
+    <text x="1.9" y="${ly + 1.1}" font-size=".72" fill="#4a3f33" ${mono}>plug (tone wood)</text>
+  </svg>`;
+}
+
+// ---------------------------------------------------------------- stage
+
+function renderStageShell() {
+  const views: [View, string][] = [["original", "Original"], ["woods", "Woods"], ["inlay", "Inlay"]];
+  $(".stage")!.innerHTML = `
+    <div class="stage-bar">
+      <span class="seg" role="group" aria-label="Preview">${views.map(([v, l]) => `<button data-view="${v}" aria-pressed="${v === view}">${l}</button>`).join("")}</span>
+      <span class="seg" role="group" aria-label="Zoom"><button data-zoom="fit" aria-pressed="${zoom === "fit"}">Fit</button><button data-zoom="real" aria-pressed="${zoom === "real"}" title="Shown at real physical size">1 : 1 real size</button></span>
+      <span class="spacer"></span>
+      <button class="btn small" data-act="calibrate" title="Make 1:1 match your screen">Calibrate screen</button>
+      <button class="btn small" data-act="png" ${work ? "" : "disabled"}>Save PNG</button>
+    </div>
+    <div class="stage-scroll"></div>
+    <div class="stage-foot"></div>`;
+  renderStage();
+}
+
+function renderStage() {
+  const scroll = $(".stage-scroll");
+  if (!scroll) return;
+  $$<HTMLButtonElement>("[data-view]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.view === view)));
+  const png = $<HTMLButtonElement>('[data-act="png"]');
+  if (png) png.disabled = !work;
+  if (!work) {
+    scroll.innerHTML = `<div class="stage-empty"><div>${STAR.replace("<svg", '<svg style="color:#e9dfcd"')}
+      <h3>No image yet</h3><p>Add artwork in step 2 (Image & size), or drop an image anywhere on this page.</p></div></div>`;
+    updateStatus();
+    return;
+  }
+  if (!$("canvas.view", scroll)) {
+    scroll.innerHTML = `<div class="stage-grid"><div class="corner">mm</div><canvas class="rx"></canvas><canvas class="ry"></canvas><canvas class="view"></canvas></div>`;
+  }
+  const cv = $<HTMLCanvasElement>("canvas.view", scroll)!;
+  cv.width = work.w; cv.height = work.h;
+  const ctx = cv.getContext("2d")!;
+  const img = view === "original" || !result ? work.rgba : view === "woods" ? result.flat : result.inlay;
+  ctx.putImageData(img, 0, 0);
+  layoutStage();
+  updateStatus();
+}
+
+function layoutStage() {
+  const scroll = $(".stage-scroll");
+  const grid = $(".stage-grid");
+  if (!scroll || !grid || !work) return;
+  const R = 24;
+  const scale = zoom === "real"
+    ? cssPxPerMm
+    : Math.max(0.05, Math.min((scroll.clientWidth - R - 40) / work.wMm, (scroll.clientHeight - R - 40) / work.hMm));
+  const W = Math.round(work.wMm * scale), H = Math.round(work.hMm * scale);
+  grid.style.gridTemplateColumns = `${R}px ${W}px`;
+  grid.style.gridTemplateRows = `${R}px ${H}px`;
+  grid.style.marginTop = zoom === "fit" ? `${Math.max(0, (scroll.clientHeight - H - R - 24) / 2)}px` : "0";
+  const cv = $<HTMLCanvasElement>("canvas.view", grid)!;
+  cv.style.width = W + "px"; cv.style.height = H + "px";
+  drawRuler($<HTMLCanvasElement>("canvas.rx", grid)!, W, R, scale, true);
+  drawRuler($<HTMLCanvasElement>("canvas.ry", grid)!, H, R, scale, false);
+}
+
+function drawRuler(c: HTMLCanvasElement, len: number, thick: number, scale: number, horiz: boolean) {
+  const dpr = window.devicePixelRatio || 1;
+  const cw = horiz ? len : thick, ch = horiz ? thick : len;
+  c.width = Math.round(cw * dpr); c.height = Math.round(ch * dpr);
+  c.style.width = cw + "px"; c.style.height = ch + "px";
+  const ctx = c.getContext("2d")!;
+  ctx.scale(dpr, dpr);
+  const minor = [1, 2, 5, 10, 20, 50, 100].find((s) => s * scale >= 5) ?? 100;
+  const major = [10, 50, 100, 200, 500, 1000].find((s) => s * scale >= 55 && s % minor === 0) ?? 1000;
+  const mm = len / scale;
+  ctx.strokeStyle = "#8d7d66"; ctx.fillStyle = "#b5a68e"; ctx.lineWidth = 1;
+  ctx.font = "9px 'IBM Plex Mono', monospace";
+  ctx.beginPath();
+  for (let v = 0; v <= mm + 1e-6; v += minor) {
+    const p = Math.round(v * scale) + 0.5;
+    const isMajor = Math.abs(v % major) < 1e-6;
+    const isMid = !isMajor && Math.abs(v % (major / 2)) < 1e-6;
+    const t = isMajor ? thick * 0.7 : isMid ? thick * 0.45 : thick * 0.25;
+    if (horiz) { ctx.moveTo(p, thick); ctx.lineTo(p, thick - t); } else { ctx.moveTo(thick, p); ctx.lineTo(thick - t, p); }
+    if (isMajor && v > 0) {
+      if (horiz) ctx.fillText(String(Math.round(v)), p + 2, 9);
+      else { ctx.save(); ctx.translate(9, p - 2); ctx.rotate(-Math.PI / 2); ctx.fillText(String(Math.round(v)), 0, 0); ctx.restore(); }
+    }
+  }
+  ctx.stroke();
+}
+
+function updateStatus() {
+  const f = $(".stage-foot");
+  if (!f) return;
+  if (!work) { f.innerHTML = `<span>No image</span>`; return; }
+  f.innerHTML = `<span>${fmt(work.wMm, 0)} × ${fmt(work.hMm, 0)} mm</span>
+    <span>${work.w} × ${work.h} px · ${fmt(work.ppm, 2)} px/mm</span>
+    <span>${zoom === "real" ? `1:1 at ${fmt(cssPxPerMm, 2)} screen px/mm` : "fit to window"}</span>
+    ${busy ? `<span class="busy">processing</span>` : result ? `<span>processed in ${fmt(result.ms / 1000, 1)} s</span>` : ""}`;
+}
+
+// ---------------------------------------------------------------- dialogs
+
+async function openProjects() {
+  const list = await store.list();
+  const dlg = document.createElement("dialog");
+  const rows = list.map((p) => `<li class="${p.id === P.id ? "current" : ""}">
+      <span class="pn">${esc(p.name)}</span>
+      <span class="pa">${p.id === P.id ? `<span class="muted mono" style="font-size:11px;align-self:center">open</span>` : `<button class="btn small" data-open="${p.id}">Open</button>`}
+        <button class="btn small ghost danger" data-del="${p.id}" aria-label="Delete ${esc(p.name)}">Delete</button></span>
+      <span class="pm">Step: ${esc(STEPS.find((s) => s.id === p.step)?.title ?? p.step)} · ${p.tones.length + 1} woods · edited ${new Date(p.updated).toLocaleString()}</span>
+    </li>`).join("");
+  dlg.innerHTML = `<div class="dlg-head"><h2>Projects</h2><button class="btn ghost small" data-close>Close</button></div>
+    <div class="dlg-body"><p class="muted" style="margin-top:0">Projects are saved in this browser automatically. Use <b>Export</b> for a backup file or to move a project to another computer.</p>
+      <ul class="plist">${rows}</ul></div>
+    <div class="dlg-foot"><button class="btn primary" data-new>New project</button></div>`;
+  document.body.append(dlg);
+  dlg.showModal();
+  dlg.addEventListener("close", () => dlg.remove());
+  dlg.addEventListener("click", async (e) => {
+    const t = e.target as HTMLElement;
+    if (t === dlg || t.closest("[data-close]")) dlg.close();
+    const open = t.closest<HTMLElement>("[data-open]")?.dataset.open;
+    if (open) { const p = await store.get(open); if (p) { await save(); dlg.close(); await loadProject(p); } }
+    const del = t.closest<HTMLElement>("[data-del]")?.dataset.del;
+    if (del) {
+      const p = list.find((x) => x.id === del)!;
+      if (!confirm(`Delete "${p.name}"? This cannot be undone. Export it first if you want a backup.`)) return;
+      await store.remove(del);
+      dlg.close();
+      if (del === P.id) {
+        const rest = await store.list();
+        await loadProject(rest[0] ?? newProject());
+        if (!rest.length) await save();
+      }
+      openProjects();
+    }
+    if (t.closest("[data-new]")) {
+      await save();
+      dlg.close();
+      await loadProject(newProject());
+      await save();
+      toast("New project started");
+    }
+  });
+}
+
+function openCalibrate() {
+  const dlg = document.createElement("dialog");
+  const W = 85.6, H = 53.98;
+  dlg.innerHTML = `<div class="dlg-head"><h2>Calibrate 1 : 1</h2><button class="btn ghost small" data-close>Close</button></div>
+    <div class="dlg-body"><p style="margin-top:0">Hold a bank card (85.6 × 54 mm) against the screen and drag the slider until the outline matches its edges.
+      Then <b>1 : 1 real size</b> shows the inlay at its true size on this screen.</p>
+      <div class="card-cal"></div>
+      <input type="range" min="2" max="8" step="0.01" value="${cssPxPerMm}" aria-label="Screen pixels per millimetre" />
+      <p class="mono muted" data-out></p></div>
+    <div class="dlg-foot"><button class="btn ghost" data-reset>Reset</button><button class="btn primary" data-save>Save</button></div>`;
+  document.body.append(dlg);
+  const card = $(".card-cal", dlg)!, range = $<HTMLInputElement>("input", dlg)!, out = $("[data-out]", dlg)!;
+  const apply = (v: number) => {
+    card.style.width = W * v + "px"; card.style.height = H * v + "px";
+    out.textContent = `${v.toFixed(2)} screen px per mm`;
+  };
+  apply(cssPxPerMm);
+  range.oninput = () => apply(Number(range.value));
+  dlg.showModal();
+  dlg.addEventListener("close", () => dlg.remove());
+  dlg.addEventListener("click", (e) => {
+    const t = e.target as HTMLElement;
+    if (t === dlg || t.closest("[data-close]")) dlg.close();
+    if (t.closest("[data-reset]")) { range.value = String(96 / 25.4); apply(96 / 25.4); }
+    if (t.closest("[data-save]")) {
+      cssPxPerMm = Number(range.value);
+      localStorage.setItem(CAL_KEY, String(cssPxPerMm));
+      dlg.close();
+      layoutStage(); updateStatus();
+      toast("Screen calibrated");
+    }
+  });
+}
+
+// ---------------------------------------------------------------- events
+
+function bindShell() {
+  $<HTMLInputElement>("#pname")!.addEventListener("input", (e) => {
+    P.name = (e.target as HTMLInputElement).value.trim() || "Untitled inlay";
+    touch(false);
+  });
+  $(".mast-actions")!.addEventListener("click", async (e) => {
+    const act = (e.target as HTMLElement).closest<HTMLElement>("[data-act]")?.dataset.act;
+    if (act === "projects") openProjects();
+    if (act === "export") { download(await exportProject(P), fileName(P)); toast("Project exported"); }
+    if (act === "import") $<HTMLInputElement>("#importFile")!.click();
+  });
+  $<HTMLInputElement>("#importFile")!.addEventListener("change", async (e) => {
+    const f = (e.target as HTMLInputElement).files?.[0];
+    if (!f) return;
+    try {
+      const p = await importProject(f);
+      await save();
+      await loadProject(p);
+      await save();
+      toast(`Imported "${p.name}"`);
+    } catch (err) {
+      toast(err instanceof Error ? err.message : "Could not import that file.");
+    }
+  });
+  $(".rail")!.addEventListener("click", (e) => {
+    const id = (e.target as HTMLElement).closest<HTMLButtonElement>("[data-goto]")?.dataset.goto;
+    if (id) goTo(id);
+  });
+  $(".foot")!.addEventListener("click", (e) => {
+    const act = (e.target as HTMLElement).closest<HTMLElement>("[data-act]")?.dataset.act;
+    if (act === "back") goTo(STEPS[Math.max(0, stepIndex() - 1)].id);
+    if (act === "next") next();
+  });
+  $(".stage")!.addEventListener("click", (e) => {
+    const t = e.target as HTMLElement;
+    const v = t.closest<HTMLElement>("[data-view]")?.dataset.view as View | undefined;
+    if (v) { view = v; renderStage(); }
+    const z = t.closest<HTMLElement>("[data-zoom]")?.dataset.zoom as Zoom | undefined;
+    if (z) {
+      zoom = z;
+      $$<HTMLButtonElement>("[data-zoom]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.zoom === zoom)));
+      layoutStage(); updateStatus();
+    }
+    const act = t.closest<HTMLElement>("[data-act]")?.dataset.act;
+    if (act === "calibrate") openCalibrate();
+    if (act === "png") {
+      $<HTMLCanvasElement>("canvas.view")?.toBlob((b) => b && download(b, fileName(P).replace(".kundekar.json", `-${view}.png`)));
+    }
+  });
+}
+
+function refreshAfterWoodChange(rerender: boolean) {
+  touch(true);
+  if (rerender) renderPanel(); else refreshLive();
+}
+
+function bindPanel() {
+  const panel = $(".panel")!;
+  $$<HTMLCanvasElement>("canvas[data-swatch]", panel).forEach((c) => {
+    const w = allWoods().find((x) => x.uid === c.dataset.swatch);
+    if (w) paintSwatch(c, w.color, w.figure, seedFor(w.uid), 0.5);
+  });
+
+  panel.onclick = (e) => {
+    const t = e.target as HTMLElement;
+    const kit = t.closest<HTMLElement>("[data-kit]")?.dataset.kit;
+    if (kit) {
+      const k = WOOD_KITS.find((x) => x.id === kit)!;
+      if (!confirm(`Replace your boards with the "${k.name}" kit?`)) return;
+      const { base, tones } = woodsFromKit(k);
+      P.base = base; P.tones = tones;
+      P.log.push({ t: Date.now(), text: `Kit: ${k.name}` });
+      refreshAfterWoodChange(true);
+      return;
+    }
+    const width = t.closest<HTMLElement>("[data-width]")?.dataset.width;
+    if (width) { setSetting("widthMm", Number(width)); renderPanel(); return; }
+    const angle = t.closest<HTMLElement>("[data-angle]")?.dataset.angle;
+    if (angle) { setSetting("vAngle", Number(angle)); renderPanel(); return; }
+
+    const act = t.closest<HTMLElement>("[data-act]")?.dataset.act;
+    if (!act) return;
+    if (act === "pick") { $<HTMLInputElement>("#imageFile")?.click(); return; }
+    if (act === "clearImage") {
+      P.image = null; P.imageName = null; result = null;
+      prepareImage().then(() => { touch(true); renderAll(); });
+      return;
+    }
+    if (act === "addTone") {
+      const used = new Set(allWoods().map((w) => w.presetId));
+      const pick = WOOD_PRESETS.find((p) => !used.has(p.id)) ?? WOOD_PRESETS[0];
+      P.tones.push(woodFromPreset(pick.id, TONE_THICKNESS));
+      refreshAfterWoodChange(true);
+      return;
+    }
+    const uid = t.closest<HTMLElement>("[data-uid]")?.dataset.uid;
+    const i = P.tones.findIndex((w) => w.uid === uid);
+    if (act === "remove" && i >= 0) {
+      if (P.tones.length <= 1) { toast("Keep at least one tone wood."); return; }
+      P.tones.splice(i, 1);
+      refreshAfterWoodChange(true);
+    }
+    if (act === "mkbase" && i >= 0) {
+      const old = P.base;
+      P.base = { ...P.tones[i], thickness: old.thickness };
+      P.tones[i] = { ...old, thickness: P.tones[i].thickness };
+      refreshAfterWoodChange(true);
+    }
+  };
+
+  panel.onchange = (e) => {
+    const t = e.target as HTMLInputElement;
+    if (t.id === "imageFile") {
+      const f = t.files?.[0];
+      if (f) setImage(f, f.name);
+      return;
+    }
+    const wood = woodFor(t);
+    if (!wood) return;
+    if (t.dataset.act === "preset") {
+      const p = presetById(t.value);
+      if (p) Object.assign(wood, { presetId: p.id, name: p.name, color: p.color, figure: p.figure });
+      else Object.assign(wood, { presetId: null, name: wood.name.startsWith("Custom") ? wood.name : `Custom (${wood.name})` });
+      refreshAfterWoodChange(true);
+    }
+    if (t.dataset.act === "color") refreshAfterWoodChange(true);
+  };
+
+  panel.oninput = (e) => {
+    const t = e.target as HTMLInputElement;
+    const key = t.dataset.set as keyof Project["settings"] | undefined;
+    if (key) {
+      const v = Number(t.value);
+      if (t.value === "" || !Number.isFinite(v)) return;
+      setSetting(key, v);
+      if (key === "vAngle") $$<HTMLButtonElement>("[data-angle]", panel).forEach((b) => b.setAttribute("aria-pressed", String(Number(b.dataset.angle) === v)));
+      if (key === "widthMm") $$<HTMLButtonElement>("[data-width]", panel).forEach((b) => b.setAttribute("aria-pressed", String(Number(b.dataset.width) === v)));
+      return;
+    }
+    const wood = woodFor(t);
+    if (!wood) return;
+    if (t.dataset.act === "thick") {
+      const v = Number(t.value);
+      if (!Number.isFinite(v) || v <= 0) return;
+      wood.thickness = clamp(v, 0.5, 60);
+      const bar = t.closest(".row")?.querySelector<HTMLElement>(".profile i");
+      if (bar) bar.style.height = clamp(wood.thickness * 1.6, 2, 22) + "px";
+      touch(false);
+      refreshLive();
+    }
+    if (t.dataset.act === "name") { wood.name = t.value.trim() || "Custom wood"; touch(false); }
+    if (t.dataset.act === "color") {
+      wood.color = t.value;
+      if (wood.presetId) { wood.name = `Custom (${wood.name})`; wood.presetId = null; }
+      const c = $<HTMLCanvasElement>(`canvas[data-swatch="${wood.uid}"]`, panel);
+      if (c) paintSwatch(c, wood.color, wood.figure, seedFor(wood.uid), 0.5);
+      touch(true);
+    }
+  };
+}
+
+function woodFor(el: HTMLElement): Wood | undefined {
+  const uid = el.closest<HTMLElement>("[data-uid]")?.dataset.uid;
+  return uid ? allWoods().find((w) => w.uid === uid) : undefined;
+}
+
+const reprepare = debounce(() => {
+  prepareWork();
+  result = null;
+  renderStage();
+  refreshLive();
+  scheduleProcess(0);
+}, 250);
+
+function setSetting(key: keyof Project["settings"], v: number) {
+  const limits: Record<keyof Project["settings"], [number, number]> = {
+    widthMm: [20, 2000], vAngle: [10, 150], pocketDepth: [0.2, 10], glueGap: [0, 3],
+    surfacePerRound: [0, 2], minRetained: [0.05, 5], simplify: [1, 4], colorWeight: [0, 1.5],
+  };
+  const [lo, hi] = limits[key];
+  P.settings[key] = clamp(v, lo, hi);
+  if (key === "widthMm") { touch(false); reprepare(); }
+  else touch(true);
+  refreshLive();
+}
+
+// Image anywhere: drop or paste.
+window.addEventListener("dragover", (e) => {
+  if (e.dataTransfer?.types.includes("Files")) { e.preventDefault(); $(".drop")?.classList.add("over"); }
+});
+window.addEventListener("dragleave", () => $(".drop")?.classList.remove("over"));
+window.addEventListener("drop", (e) => {
+  const f = e.dataTransfer?.files?.[0];
+  if (!f) return;
+  e.preventDefault();
+  if (f.name.endsWith(".json")) { importFromDrop(f); return; }
+  setImage(f, f.name);
+});
+window.addEventListener("paste", (e) => {
+  const item = [...(e.clipboardData?.items ?? [])].find((i) => i.type.startsWith("image/"));
+  const f = item?.getAsFile();
+  if (f) setImage(f, f.name || "Pasted image");
+});
+window.addEventListener("resize", debounce(layoutStage, 100));
+window.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && (e.target as HTMLElement).closest?.(".drop")) $<HTMLInputElement>("#imageFile")?.click();
+});
+
+async function importFromDrop(f: File) {
+  try {
+    const p = await importProject(f);
+    await save();
+    await loadProject(p);
+    await save();
+    toast(`Imported "${p.name}"`);
+  } catch (err) {
+    toast(err instanceof Error ? err.message : "Could not import that file.");
+  }
+}
+
+// ---------------------------------------------------------------- boot
+
+const app = document.getElementById("app")!;
+
+(async () => {
+  let p: Project | undefined;
+  try {
+    const last = lastProjectId.get();
+    p = (last && (await store.get(last))) || (await store.list())[0];
+  } catch {
+    toast("Browser storage is unavailable; this project will not be saved.");
+  }
+  await loadProject(p ?? newProject());
+  if (!p) await save().catch(() => {});
+})();

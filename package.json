@@ -1,0 +1,17 @@
+{
+  "name": "kundekar",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Image-to-inlay CAM for multi-wood V-carve artwork",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "deploy": "npm run build && node scripts/deploy.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0",
+    "vite": "^7.0.0"
+  }
+}
