@@ -24,6 +24,23 @@ export interface MachineSettings {
   colorWeight: number; // 0 = "Light & dark" (lightness only), 1 = "Color" (full perceptual distance)
   smoothing: number; // 0 = raw pixel edges, 1 = strongly rounded region borders
   cureHours: number; // glue cure time before surfacing
+  // Tools and feeds (mm, mm/min). One file per tool per operation.
+  vFeed: number;
+  vPlunge: number;
+  vStep: number; // spacing of V-carve contours
+  rpm: number;
+  millOn: number; // 1 = clear pocket floors with a flat end mill, 0 = V-bit only
+  millDia: number;
+  millFeed: number;
+  millPlunge: number;
+  millStepdown: number;
+  millStepover: number; // % of diameter
+  surfDia: number;
+  surfFeed: number;
+  surfStepdown: number;
+  surfStepover: number; // % of diameter
+  safeZ: number;
+  flavor: "mach3" | "generic";
 }
 
 export type NumericSetting = { [K in keyof MachineSettings]: MachineSettings[K] extends number ? K : never }[keyof MachineSettings];
@@ -47,6 +64,22 @@ export const DEFAULT_SETTINGS: MachineSettings = {
   colorWeight: 0,
   smoothing: 0.7,
   cureHours: 24,
+  vFeed: 1000,
+  vPlunge: 300,
+  vStep: 0.15,
+  rpm: 18000,
+  millOn: 1,
+  millDia: 3.175,
+  millFeed: 1200,
+  millPlunge: 300,
+  millStepdown: 1,
+  millStepover: 40,
+  surfDia: 22,
+  surfFeed: 2000,
+  surfStepdown: 0.5,
+  surfStepover: 40,
+  safeZ: 5,
+  flavor: "mach3",
 };
 
 export const SIZE_PRESETS: { label: string; widthMm: number; heightMm: number }[] = [

@@ -286,10 +286,10 @@ function majority(labels: Uint8Array, w: number, h: number, k: number) {
   }
 }
 
-const INF = 1e20;
+export const INF = 1e20;
 
 /** Felzenszwalb & Huttenlocher exact squared Euclidean distance transform, in place. */
-function edt(f: Float32Array, w: number, h: number) {
+export function edt(f: Float32Array, w: number, h: number) {
   const m = Math.max(w, h);
   const d = new Float32Array(m), v = new Int32Array(m), z = new Float32Array(m + 1), g = new Float32Array(m);
   const pass = (len: number, get: (i: number) => number, set: (i: number, val: number) => void) => {

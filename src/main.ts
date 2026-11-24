@@ -15,6 +15,8 @@ import {
   exportProject, fileName, importProject, lastProjectId, newProject, store, type Project,
 } from "./project";
 import ProcessWorker from "./worker?worker";
+import GcodeWorker from "./gcode.worker?worker";
+import type { GcodeFile, GcodeRequest, GcodeResponse } from "./gcode.worker";
 import type { JobRequest, JobResponse } from "./worker";
 
 // ---------------------------------------------------------------- state
@@ -571,9 +573,9 @@ function renderImage(): string {
     <div class="sec"><h3>Result</h3><dl class="readout" data-live="size"></dl></div>`;
 }
 
-function numField(key: NumericSetting, label: string, hint: string, min: number, max: number, step: number) {
+function numField(key: NumericSetting, label: string, hint: string, min: number, max: number, step: number, unit = "mm") {
   return `<div class="field"><label for="f-${key}">${label}</label>
-    <span><input id="f-${key}" type="number" min="${min}" max="${max}" step="${step}" value="${P.settings[key]}" data-set="${key}" /><span class="unit">mm</span></span>
+    <span><input id="f-${key}" type="number" min="${min}" max="${max}" step="${step}" value="${P.settings[key]}" data-set="${key}" /><span class="unit">${unit}</span></span>
     <span class="hint">${hint}</span></div>`;
 }
 
@@ -593,6 +595,32 @@ function renderMachine(): string {
       ${numField("minRetained", "Thinnest edge kept", "The shallowest inlay edge worth keeping after all surfacing.", 0.1, 3, 0.1)}
     </div>
     <div class="sec"><h3>Cross-section <span>to scale, top of the base board</span></h3><div data-live="section"></div></div>
+    <div class="sec"><h3>V-bit cutting <span>for the G-code files</span></h3>
+      ${numField("vFeed", "Feed", "", 50, 10000, 50, "mm/min")}
+      ${numField("vPlunge", "Plunge", "", 20, 5000, 10, "mm/min")}
+      ${numField("vStep", "Contour spacing", "Distance between V-carve passes. Walls come out exact either way; smaller leaves smaller ridges on the floor.", 0.05, 1, 0.05)}
+      ${numField("rpm", "Spindle", "Used for all tools.", 1000, 60000, 500, "rpm")}
+    </div>
+    <div class="sec"><h3>Clearing end mill</h3>
+      <label class="check" style="margin-bottom:10px"><input type="checkbox" data-act="millOn" ${s.millOn ? "checked" : ""} /> Clear wide floors with a flat end mill (much faster)</label>
+      ${s.millOn ? `${numField("millDia", "Diameter", "", 0.5, 25, 0.025)}
+      ${numField("millFeed", "Feed", "", 50, 10000, 50, "mm/min")}
+      ${numField("millPlunge", "Plunge", "", 20, 5000, 10, "mm/min")}
+      ${numField("millStepdown", "Depth per pass", "", 0.1, 10, 0.1)}
+      ${numField("millStepover", "Stepover", "", 10, 90, 5, "%")}` : ""}
+    </div>
+    <div class="sec"><h3>Surfacing bit</h3>
+      ${numField("surfDia", "Diameter", "", 3, 80, 0.5)}
+      ${numField("surfFeed", "Feed", "", 50, 10000, 50, "mm/min")}
+      ${numField("surfStepdown", "Depth per pass", "The glued plug board stands proud; it is flattened in passes this deep. Saw most of it off first to save time.", 0.05, 5, 0.05)}
+      ${numField("surfStepover", "Stepover", "", 10, 90, 5, "%")}
+    </div>
+    <div class="sec"><h3>Machine</h3>
+      ${numField("safeZ", "Safe height", "Rapid moves above the work and clamps.", 1, 100, 1)}
+      <div class="field"><label>G-code files</label><span class="seg" role="group" aria-label="G-code flavour">
+        <button data-flavor="mach3" aria-pressed="${s.flavor === "mach3"}">Mach3 (.tap)</button><button data-flavor="generic" aria-pressed="${s.flavor === "generic"}">Generic (.nc)</button></span>
+        <span class="hint">Metric, absolute, one tool per file, no tool changes. Generic suits GRBL and most controllers.</span></div>
+    </div>
     <div class="sec"><h3>What this means</h3><dl class="readout" data-live="derived"></dl></div>
     <div class="sec" data-live="warns"></div>`;
 }
@@ -757,17 +785,22 @@ function renderRounds(): string {
       const w = woods[p.wood];
       return tick(`r${i}:plug:${w.uid}`, `Cut the ${esc(w.name)} plug (mirrored)`,
         `From a ${fmt(w.thickness)} mm ${esc(w.name)} board at least <b>${fmt(p.w, 0)} × ${fmt(p.h, 0)} mm</b>. V-bit ${s.vAngle}°, plug depth <b>${fmt(plugD)} mm</b> (pocket + ${fmt(s.glueGap)} mm glue gap). ${fmt(p.areaMm2 / 100, 1)} cm².`,
-        `<p class="tfiles"><button class="btn small" data-dl="plug:${i}:${p.wood}">↓ Plug SVG</button></p>`);
+        `<p class="tfiles">${s.millOn ? `<button class="btn small" data-nc="plug:${i}:clear:${p.wood}">↓ Clear (end mill)</button>` : ""}
+           <button class="btn small" data-nc="plug:${i}:v:${p.wood}">↓ V-carve (V-bit)</button>
+           <button class="btn small ghost" data-dl="plug:${i}:${p.wood}">SVG</button></p>`);
     }).join("");
     return `<section class="round sel ${doneN === keys.length ? "done" : ""}">${head}
       <ol class="tasks">
         ${tick(`r${i}:pocket`, `Cut the pocket into the ${esc(P.base.name)}`,
           `V-bit ${s.vAngle}°, <b>${fmt(D)} mm deep</b> from the current top (${fmt(top)} mm thick): Z <b>${fmt(-(i * sr + D))}</b> from the original top. ${fmt(r.pocketAreaMm2 / 100, 1)} cm², from X ${fmt(b.x0, 0)}–${fmt(b.x1, 0)} and Y ${fmt(b.y0, 0)}–${fmt(b.y1, 0)} mm (board's top-left corner).`,
-          `<p class="tfiles"><button class="btn small" data-dl="pocket:${i}">↓ Pocket SVG</button></p>`)}
+          `<p class="tfiles">${s.millOn ? `<button class="btn small" data-nc="pocket:${i}:clear">↓ 1 · Clear (${fmt(s.millDia, 1)} mm end mill)</button>` : ""}
+             <button class="btn small" data-nc="pocket:${i}:v">↓ ${s.millOn ? 2 : 1} · V-carve (${s.vAngle}° V-bit)</button>
+             <button class="btn small ghost" data-dl="pocket:${i}">SVG</button></p>`)}
         ${plugs}
         ${tick(`r${i}:glue`, `Glue the plug${r.plugs.length > 1 ? "s" : ""} in and clamp`, `<span data-cure="${i}">${cureText(i)}</span>`)}
         ${tick(`r${i}:surface`, "Surface flat",
-          `Down to Z <b>${fmt(-(i + 1) * sr)}</b> from the original top: removes the plug's excess and ${fmt(sr)} mm of the base. The board is then ${fmt(T - (i + 1) * sr)} mm thick.`)}
+          `Down to Z <b>${fmt(-(i + 1) * sr)}</b> from the original top: removes the plug's excess and ${fmt(sr)} mm of the base. The board is then ${fmt(T - (i + 1) * sr)} mm thick.`,
+          `<p class="tfiles"><button class="btn small" data-nc="surface:${i}:surface">↓ Surfacing (${fmt(s.surfDia, 1)} mm bit)</button></p>`)}
       </ol></section>`;
   }).join("");
   const d = derive(s, P.base, P.tones);
@@ -783,6 +816,73 @@ function renderRounds(): string {
     </div>
     <div class="sec rounds-list">${cards}</div>
     <div class="sec"><p class="muted" style="font-size:12.5px;margin:0">Changing the image, woods or settings after you start cutting changes this plan. Export the project as a backup before you begin. Files are SVG in millimetres; native G-code comes in the next milestone.</p></div>`;
+}
+
+// ---- G-code downloads (generated in their own worker, cached per result and settings)
+
+let gcodeWorker: Worker | null = null;
+let gcodeSeq = 0;
+const gcodeWaiting = new Map<number, (r: GcodeResponse) => void>();
+const gcodeCache = new Map<string, GcodeFile[]>();
+
+function runGcode(req: GcodeRequest): Promise<GcodeResponse> {
+  if (!gcodeWorker) {
+    gcodeWorker = new GcodeWorker();
+    gcodeWorker.onmessage = (e: MessageEvent<GcodeResponse>) => { gcodeWaiting.get(e.data.id)?.(e.data); gcodeWaiting.delete(e.data.id); };
+  }
+  return new Promise((resolve) => { gcodeWaiting.set(req.id, resolve); gcodeWorker!.postMessage(req); });
+}
+
+async function downloadGcode(spec: string, btn: HTMLButtonElement) {
+  const plan = roundPlan();
+  if (!plan || !work) return;
+  const [op, ri, part, wj] = spec.split(":") as ["pocket" | "plug" | "surface", string, "clear" | "v" | "surface", string?];
+  const i = Number(ri), r = plan.shapes[i];
+  const s = P.settings, woods = allWoods();
+  const D = s.pocketDepth, gap = s.glueGap, S = D - gap, sr = s.surfacePerRound, zTop = -i * sr;
+  const slug = (t: string) => t.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  const prefix = `${fileName(P).replace(".kundekar.json", "")}-R${i + 1}-`;
+  const baseZero = "Stock: the base board. Zero X0 Y0 at its bottom-left corner and Z0 on its ORIGINAL top surface. Keep this zero for every round.";
+  const plug = op === "plug" ? r.plugs.find((q) => q.wood === Number(wj)) : undefined;
+  const toneT = Math.max(...r.plugs.map((q) => woods[q.wood].thickness));
+  const req: GcodeRequest = {
+    id: ++gcodeSeq, op,
+    loops: op === "pocket" ? r.pocket : plug ? plug.loops : [],
+    stockW: plug ? plug.w : work.wMm, stockH: plug ? plug.h : work.hMm,
+    v: { angle: s.vAngle, step: s.vStep }, vFeed: s.vFeed, vPlunge: s.vPlunge,
+    mill: s.millOn ? { dia: s.millDia, stepover: s.millStepover / 100, stepdown: s.millStepdown, feed: s.millFeed, plunge: s.millPlunge } : null,
+    surf: { dia: s.surfDia, stepover: s.surfStepover / 100, stepdown: s.surfStepdown, feed: s.surfFeed, plunge: s.millPlunge },
+    rpm: s.rpm, safeZ: s.safeZ, flavor: s.flavor,
+    depth: D, zTop, startDepth: S, plugDepth: D + gap,
+    zStart: zTop + Math.max(0, toneT - S), zEnd: -(i + 1) * sr,
+    prefix, wood: plug ? slug(woods[plug.wood].name) : "",
+    title: op === "pocket" ? `${P.name} - round ${i + 1} - pocket in the ${P.base.name}`
+      : op === "plug" ? `${P.name} - round ${i + 1} - ${woods[plug!.wood].name} plug, mirrored`
+      : `${P.name} - round ${i + 1} - surfacing`,
+    zeroNote: plug
+      ? `Stock: a ${woods[plug.wood].name} board at least ${fmt(plug.w, 0)} x ${fmt(plug.h, 0)} mm and ${fmt(woods[plug.wood].thickness)} mm thick. Zero X0 Y0 at its bottom-left corner, Z0 on its top. The shapes are already mirrored.`
+      : baseZero,
+  };
+  const key = JSON.stringify([roundCache?.of === result ? jobId : -1, op, i, wj ?? "", s, woods.map((w) => [w.uid, w.thickness]), P.name]);
+  let files = gcodeCache.get(key);
+  if (!files) {
+    const label = btn.textContent;
+    btn.disabled = true; btn.textContent = "Generating…";
+    const res = await runGcode(req);
+    btn.disabled = false; btn.textContent = label;
+    if (res.error || !res.files) { toast("G-code failed: " + (res.error ?? "no output")); return; }
+    files = res.files;
+    gcodeCache.set(key, files);
+  }
+  const want = part === "clear" ? files.find((f) => f.name.includes("-clear-"))
+    : part === "v" ? files.find((f) => /-V\d+\./.test(f.name))
+    : files[0];
+  if (!want) {
+    toast(part === "clear" ? "No floor here is wide enough for the end mill: only the V-carve file is needed." : "Nothing to cut in this file.");
+    return;
+  }
+  download(new Blob([want.text], { type: "text/plain" }), want.name);
+  toast(`${want.name}: about ${Math.max(1, Math.round(want.seconds / 60))} min of cutting. Simulate it before running.`);
 }
 
 function svgFile(wMm: number, hMm: number, comment: string, loops: Float32Array[]): Blob {
@@ -1533,6 +1633,8 @@ function bindPanel() {
     if (rd !== undefined) { selRound = Number(rd); renderPanel(); drawVector(); return; }
     const dl = t.closest<HTMLElement>("[data-dl]")?.dataset.dl;
     if (dl) { downloadRoundFile(dl); return; }
+    const nc = t.closest<HTMLElement>("[data-nc]")?.dataset.nc;
+    if (nc) { downloadGcode(nc, t.closest<HTMLButtonElement>("[data-nc]")!); return; }
     const mt = t.closest<HTMLElement>("[data-masktool]")?.dataset.masktool as "keep" | "cut" | undefined;
     if (mt) { maskTool = maskTool === mt ? null : mt; view = "original"; renderPanel(); renderStage(); return; }
     const tl = t.closest<HTMLElement>("[data-tool]")?.dataset.tool as Tool | undefined;
@@ -1561,6 +1663,8 @@ function bindPanel() {
       sizeChanged(true);
       return;
     }
+    const flavor = t.closest<HTMLElement>("[data-flavor]")?.dataset.flavor as "mach3" | "generic" | undefined;
+    if (flavor) { P.settings.flavor = flavor; touch(false); renderPanel(); return; }
     const match = t.closest<HTMLElement>("[data-match]")?.dataset.match;
     if (match !== undefined) { P.settings.colorWeight = Number(match); touch(true); renderPanel(); return; }
     const mode = t.closest<HTMLElement>("[data-sizemode]")?.dataset.sizemode as SizeMode | undefined;
@@ -1659,6 +1763,7 @@ function bindPanel() {
       renderPanel();
       return;
     }
+    if (t.dataset.act === "millOn") { P.settings.millOn = t.checked ? 1 : 0; touch(false); renderPanel(); return; }
     if (t.dataset.act === "maskOn") {
       P.maskOn = t.checked;
       sizeChanged(false);
@@ -1778,6 +1883,9 @@ function setSetting(key: NumericSetting, v: number) {
   const limits: Record<NumericSetting, [number, number]> = {
     widthMm: [20, 2000], heightMm: [20, 2000], marginMm: [0, 200], imgX: [-5000, 5000], imgY: [-5000, 5000], imgWidthMm: [5, 5000], vAngle: [10, 150], pocketDepth: [0.2, 10], glueGap: [0, 3],
     surfacePerRound: [0, 2], minRetained: [0.05, 5], minLineMm: [0, 10], minAreaMm2: [0, 100], colorWeight: [0, 1], smoothing: [0, 1], cureHours: [0.5, 168],
+    vFeed: [50, 10000], vPlunge: [20, 5000], vStep: [0.05, 1], rpm: [1000, 60000], millOn: [0, 1], millDia: [0.5, 25],
+    millFeed: [50, 10000], millPlunge: [20, 5000], millStepdown: [0.1, 10], millStepover: [10, 90], surfDia: [3, 80],
+    surfFeed: [50, 10000], surfStepdown: [0.05, 5], surfStepover: [10, 90], safeZ: [1, 100],
   };
   const [lo, hi] = limits[key];
   P.settings[key] = clamp(v, lo, hi);

@@ -24,7 +24,7 @@ cure between rounds), so everything is saved in your browser automatically. Use
 | 3. Bit & depths | V-bit angle, pocket depth, glue gap, surfacing per round. Shows the narrowest region the bit can hold, with a to-scale cross-section. |
 | 4. Simplify | The image is reduced to your woods; lines thinner and areas smaller than your limits are merged away. Vector preview, SVG export. |
 | 5. Refine | Fix regions by hand: fill, remove, brush, lasso. Edits are re-applied when woods or settings change. |
-| 6. Rounds | Round plan (touching woods never share a round), pocket and mirrored plug SVGs per round in mm, a checklist with Z depths per step, and a glue-cure timer. |
+| 6. Rounds | Round plan (touching woods never share a round), a checklist with Z depths and a glue-cure timer, and per round: G-code (.tap for Mach3 / .nc) for pocket clearing, pocket V-carve, plug clearing, plug V-carve and surfacing, plus SVGs. |
 
 Everything runs locally in the browser. Images are never uploaded. AI background removal uses
 [ORMBG](https://huggingface.co/onnx-community/ormbg-ONNX) (Apache-2.0) via
@@ -37,8 +37,8 @@ downloaded from Hugging Face on first use and cached.
 - [x] **MVP 1:** wood stock with presets, image → wood-color simplification, minimum-feature
       cleanup, real-scale preview, saved multi-day projects
 - [x] **MVP 2:** round planning, per-round pocket and plug SVGs, workshop checklist (DXF later if needed)
-- [ ] **MVP 3:** native G-code (clearing, V-carve, plug, surfacing, registration holes)
-      with a generic post-processor (Mach3 profile first)
+- [x] **MVP 3:** native G-code: end-mill clearing, V-carve pockets and mirrored plugs,
+      surfacing; Mach3 (.tap) and generic (.nc). *Registration holes not yet.*
 - [ ] Downloadable/offline version (same TypeScript core)
 - [ ] Extras: engraving lines, 2.5D relief
 
@@ -57,6 +57,17 @@ npm run deploy    # build and publish dist/ to the gh-pages branch
 
 The core (`src/core/`) has no DOM dependencies, so it can later run in Node for a
 command-line or desktop version.
+
+## How the toolpaths work
+
+All toolpaths come from one signed distance field of each shape. The V-bit follows
+contours parallel to the outline, each at depth = distance / tan(angle/2), which makes
+the walls exact; an end mill clears the flat floor without touching the walls; whatever
+the passes leave short of the ideal surface is thinned to its centre line and cut along
+it with the tip at the ideal depth (which can never overcut). Plugs use the same field
+outward with a start depth of pocket depth − glue gap. Every change is checked by
+simulating the generated G-code on a height map: no overcut beyond ~0.05 mm, and plug
+and pocket walls agree to ~0.1 mm on a deliberately hard test shape.
 
 ## Safety
 

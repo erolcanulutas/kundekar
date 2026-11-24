@@ -138,8 +138,12 @@ Implemented in `src/core/simplify.ts` (steps 1–3 and a colour-level version of
    only later-round woods are filled in the pocket/plug. Cut these in existing CAM first
    to validate the process. Not yet: nesting several islands onto smaller plug boards,
    DXF, region-level (rather than wood-level) round planning.
-4. **MVP 3:** native G-code generation: clearing, V-carve, plug, surfacing,
-   registration holes. Generic post-processor.
+4. **MVP 3:** done (2026-11-25) except registration holes. Toolpaths from a signed
+   distance field (V-bit wall contours, end-mill floor clearing, skeleton cleanup of the
+   leftover at ideal depth), plugs with start depth = pocket − glue gap, zigzag surfacing
+   in passes. Mach3 .tap and generic .nc, one file per tool per operation, Z0 kept on
+   the base's original top for every round. Verified by height-map simulation of the
+   emitted G-code. Next: registration pin holes, smarter linking (fewer lifts), arcs.
 5. Downloadable/offline version reusing the same core.
 6. Extras: engraving lines, 2.5D, UI polish.
 
